@@ -30,7 +30,7 @@ fn main() {
     // set the gl clear colour to something new
     unsafe {
         gl::Viewport(0, 0, 810, 540);
-        gl::ClearColor(0.3, 0.3, 0.5, 1.0);
+        gl::ClearColor(1.0, 1.0, 1.0, 1.0);
     }
 
     // create vertex shader form source
@@ -49,9 +49,10 @@ fn main() {
     ).unwrap();
 
     let vertices: Vec<f32> = vec![
-        -0.5, -0.5, 0.0,
-        0.5, -0.5, 0.0,
-        0.0, 0.5, 0.0,
+        // positions       // colours
+        -0.5, -0.5, 0.0,   1.0, 0.0, 0.0,
+        0.5, -0.5, 0.0,    0.0, 1.0, 0.0,
+        0.0, 0.5, 0.0,     0.0, 0.0, 1.0,
     ];
 
     // creating buffer object to that stores vertex data
@@ -84,8 +85,17 @@ fn main() {
             3, // the number of components per vertex
             gl::FLOAT, // data type
             gl::FALSE, // normalized (int-to-float conversion)
-            (3 * std::mem::size_of::<f32>()) as gl::types::GLint, // stride (byte offset between attributes)
+            (6 * std::mem::size_of::<f32>()) as gl::types::GLint, // stride (byte offset between attributes)
             std::ptr::null()); // offset of the first component
+
+        gl::EnableVertexAttribArray(1);
+        gl::VertexAttribPointer(
+            1, // index of the generic vertex attribute
+            3, // the number of components per vertex
+            gl::FLOAT, // data type
+            gl::FALSE, // normalized (int-to-float conversion)
+            (6 * std::mem::size_of::<f32>()) as gl::types::GLint, // stride (byte offset between attributes)
+            (3 * std::mem::size_of::<f32>()) as *const gl::types::GLvoid); // offset of the first component
 
         // unbind everything as they are no longer be changed
         gl::BindBuffer(gl::ARRAY_BUFFER, 0);
