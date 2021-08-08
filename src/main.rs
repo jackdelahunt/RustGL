@@ -1,9 +1,13 @@
 extern crate sdl2;
 extern crate gl;
-pub mod render_gl;
+pub mod renderer;
 
 use sdl2::event::Event;
 use std::ffi::CString;
+use renderer::vertex_buffer::VertexBuffer;
+use renderer::vertex_array::VertexArray;
+use renderer::shader::Shader;
+use renderer::program::Program;
 
 fn main() {
     let sdl = sdl2::init().unwrap();
@@ -34,45 +38,39 @@ fn main() {
     }
 
     // create vertex shader form source
-    let vertex_shader = render_gl::Shader::from_vert_source(
+    let vertex_shader = Shader::from_vert_source(
         &CString::new(include_str!("triangle.vert")).unwrap()
     ).unwrap();
 
     // create fragment shader form source
-    let fragment_shader = render_gl::Shader::from_frag_source(
+    let fragment_shader = Shader::from_frag_source(
         &CString::new(include_str!("triangle.frag")).unwrap()
     ).unwrap();
 
     // make program and use it
-    let shader_program = render_gl::Program::from_shaders(
+    let shader_program = Program::from_shaders(
         &[vertex_shader, fragment_shader]
     ).unwrap();
 
     let vertices: Vec<f32> = vec![
         // unique vertices     // colours
-        0.5,  0.5, 0.0,        1.0, 0.0, 0.0,
+        0.0, 0.5, 0.0,         1.0, 0.0, 0.0,
         0.5, -0.5, 0.0,        0.0, 1.0, 0.0,
         -0.5, -0.5, 0.0,       0.0, 0.0, 1.0,
-        -0.5,  0.5, 0.0,        1.0, 0.0, 1.0
     ];
 
     let indices: Vec<i32> = vec![
-        0, 1, 3,
-        1, 2, 3
+        0, 1, 2,
     ];
 
-    let vertex_buffer = render_gl::VertexBuffer::new(vertices).unwrap();
+    let vertex_buffer = VertexBuffer::new(vertices).unwrap();
 
-    let vertex_array = render_gl::VertexArray::new(&vertex_buffer).unwrap();
+    let vertex_array = VertexArray::new(&vertex_buffer).unwrap();
     vertex_array.attribute(0, 3, 6, 0);
     vertex_array.attribute(1, 3, 6, 3);
     vertex_array.bind_element_array(&indices);
 
     let mut event_pump = sdl.event_pump().unwrap();
-
-    let mut r_time: f32 = 0.0;
-    let mut g_time: f32 = 0.0;
-    let mut b_time: f32 = 0.0;
 
     'main_loop: loop {
         for event in event_pump.poll_iter() {
@@ -91,21 +89,10 @@ fn main() {
             gl::Clear(gl::COLOR_BUFFER_BIT);
         }
 
-        r_time += 0.1;
-        g_time += 0.15;
-        b_time += 0.2;
-
         shader_program.set_used();
-        shader_program.set_uniform_vec4(
-            "ourColour",
-            (r_time.sin() / 2.0) + 0.5,
-            ((g_time + 0.15).sin() / 2.0) + 0.5,
-            ((b_time + 0.82).sin() / 2.0) + 0.5,
-            0.0);
-
         unsafe {
             gl::BindVertexArray(vertex_array.id);
-            gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, indices.as_ptr() as *const gl::types::GLvoid);
+            gl::DrawElements(gl::TRIANGLES, 3, gl::UNSIGNED_INT, indices.as_ptr() as *const gl::types::GLvoid);
             gl::BindVertexArray(0);
         }
 

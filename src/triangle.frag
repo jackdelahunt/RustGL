@@ -3,9 +3,7 @@
 in vec3 vertexColour;
 out vec4 colour;
 
-uniform vec4 ourColour;
-
 void main()
 {
-    colour = ourColour;
+    colour = vec4(vertexColour, 1.0);
 }
