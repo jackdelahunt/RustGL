@@ -49,21 +49,16 @@ fn main() {
     ).unwrap();
 
     let vertices: Vec<f32> = vec![
-        // main triangle
-        // positions       // colours
-        -0.5, -0.5, 0.0,   1.0, 0.0, 0.0,
-        0.5, -0.5, 0.0,    0.0, 1.0, 0.0,
-        0.0, 0.5, 0.0,     0.0, 0.0, 1.0,
+        // unique vertices     // colours
+        0.5,  0.5, 0.0,        1.0, 0.0, 0.0,
+        0.5, -0.5, 0.0,        0.0, 1.0, 0.0,
+        -0.5, -0.5, 0.0,       0.0, 0.0, 1.0,
+        -0.5,  0.5, 0.0,        1.0, 0.0, 1.0
+    ];
 
-        // right triangle
-        0.5, -0.5, 0.0,    0.0, 1.0, 0.0,
-        0.5, 0.5, 0.0,     1.0, 0.0, 0.0,
-        0.0, 0.5, 0.0,     0.0, 0.0, 1.0,
-
-        // left triangle
-        0.0, 0.5, 0.0,     0.0, 0.0, 1.0,
-        -0.5, -0.5, 0.0,    1.0, 0.0, 0.0,
-        -0.5, 0.5, 0.0,     0.0, 1.0, 0.0,
+    let indices: Vec<i32> = vec![
+        0, 1, 3,
+        1, 2, 3
     ];
 
     let vertex_buffer = render_gl::VertexBuffer::new(vertices).unwrap();
@@ -71,6 +66,7 @@ fn main() {
     let vertex_array = render_gl::VertexArray::new(&vertex_buffer).unwrap();
     vertex_array.attribute(0, 3, 6, 0);
     vertex_array.attribute(1, 3, 6, 3);
+    vertex_array.bind_element_array(&indices);
 
     let mut event_pump = sdl.event_pump().unwrap();
     'main_loop: loop {
@@ -93,11 +89,8 @@ fn main() {
         shader_program.set_used();
         unsafe {
             gl::BindVertexArray(vertex_array.id);
-            gl::DrawArrays(
-                gl::TRIANGLES, // mode
-                0, // starting index in the enabled arrays
-                9 // number of indices to be rendered
-            );
+            gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, indices.as_ptr() as *const gl::types::GLvoid);
+            gl::BindVertexArray(0);
         }
 
         window.gl_swap_window();

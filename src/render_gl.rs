@@ -161,6 +161,26 @@ impl VertexArray {
         return Ok(Self {id})
     }
 
+    pub fn bind_element_array(&self, indices: &Vec<i32>) {
+        let mut ebo: gl::types::GLuint = 0;
+        unsafe {
+            gl::BindVertexArray(self.id);
+
+            gl::GenBuffers(1, &mut ebo);
+            gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, ebo);
+            gl::BufferData(
+                gl::ELEMENT_ARRAY_BUFFER, // what type of buffer
+                (indices.len() * std::mem::size_of::<f32>()) as gl::types::GLsizeiptr, // size of data in bytes
+                indices.as_ptr() as *const gl::types::GLvoid, // pointer to data
+                gl::STATIC_DRAW, // usage
+            );
+
+            // unbind as it is no longer be changed
+            gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, 0);
+            gl::BindVertexArray(0);
+        }
+    }
+
     pub fn attribute(&self, index: u32, components: i32, stride: usize, offset: usize) -> () {
         unsafe {
             gl::BindVertexArray(self.id);
