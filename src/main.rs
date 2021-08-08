@@ -47,7 +47,50 @@ fn main() {
     let shader_program = render_gl::Program::from_shaders(
         &[vertex_shader, fragment_shader]
     ).unwrap();
-    shader_program.set_used();
+
+    let vertices: Vec<f32> = vec![
+        -0.5, -0.5, 0.0,
+        0.5, -0.5, 0.0,
+        0.0, 0.5, 0.0,
+    ];
+
+    // creating buffer object to that stores vertex data
+    let mut vbo: gl::types::GLuint = 0;
+    unsafe {
+        gl::GenBuffers(1, &mut vbo);
+        gl::BindBuffer(gl::ARRAY_BUFFER, vbo);
+        gl::BufferData(
+            gl::ARRAY_BUFFER, // what type of buffer
+            (vertices.len() * std::mem::size_of::<f32>()) as gl::types::GLsizeiptr, // size of data in bytes
+            vertices.as_ptr() as *const gl::types::GLvoid, // pointer to data
+            gl::STATIC_DRAW, // usage
+        );
+
+        // unbind as it is no longer be changed
+        gl::BindBuffer(gl::ARRAY_BUFFER, 0);
+    }
+
+    // creating vertex array that uses buffered data
+    let mut vao: gl::types::GLuint = 0;
+    unsafe {
+        gl::GenVertexArrays(1, &mut vao);
+        gl::BindVertexArray(vao);
+
+        // link buffer data to this vertex array
+        gl::BindBuffer(gl::ARRAY_BUFFER, vbo);
+        gl::EnableVertexAttribArray(0);
+        gl::VertexAttribPointer(
+            0, // index of the generic vertex attribute
+            3, // the number of components per vertex
+            gl::FLOAT, // data type
+            gl::FALSE, // normalized (int-to-float conversion)
+            (3 * std::mem::size_of::<f32>()) as gl::types::GLint, // stride (byte offset between attributes)
+            std::ptr::null()); // offset of the first component
+
+        // unbind everything as they are no longer be changed
+        gl::BindBuffer(gl::ARRAY_BUFFER, 0);
+        gl::BindVertexArray(0);
+    }
 
     let mut event_pump = sdl.event_pump().unwrap();
     'main_loop: loop {
@@ -65,6 +108,16 @@ fn main() {
             // set pixels on screen to the colour set with ClearColor as
             // indicated with the COLOR_BUFFER_BIT, could be depth or bit
             gl::Clear(gl::COLOR_BUFFER_BIT);
+        }
+
+        shader_program.set_used();
+        unsafe {
+            gl::BindVertexArray(vao);
+            gl::DrawArrays(
+                gl::TRIANGLES, // mode
+                0, // starting index in the enabled arrays
+                3 // number of indices to be rendered
+            );
         }
 
         window.gl_swap_window();
