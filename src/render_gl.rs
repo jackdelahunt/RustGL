@@ -69,19 +69,43 @@ pub struct Shader {
 }
 
 impl Shader {
-    pub fn from_source(source: &CStr, kind: gl::types::GLenum) -> Result<Shader , String> {
-        let id = shader_from_source(source, kind)?;
+    pub fn new(source: &CStr, kind: gl::types::GLenum) -> Result<Self , String> {
+        // create shader and get reference
+        let id = unsafe { gl::CreateShader(kind) };
+
+        unsafe {
+            // set the source code in the referenced shader with the input source
+            gl::ShaderSource(id, 1, &source.as_ptr(), std::ptr::null());
+            gl::CompileShader(id);
+
+            // get the compile status of the shader
+            let mut success: gl::types::GLint = 1;
+            gl::GetShaderiv(id, gl::COMPILE_STATUS, &mut success);
+
+            if success == 0 {
+                // if compile failed get length of error in shader
+                let mut error_length: gl::types::GLint = 0;
+                gl::GetShaderiv(id, gl::INFO_LOG_LENGTH, &mut error_length);
+
+                let error = create_whitespace_c_string(error_length as usize);
+
+                // fill error with info log in shader
+                gl::GetShaderInfoLog(id, error_length, std::ptr::null_mut(), error.as_ptr() as *mut gl::types::GLchar);
+                return Err(error.to_string_lossy().into_owned());
+            }
+        }
+
         return Ok(Self {
-            id,
+            id
         });
     }
 
     pub fn from_vert_source(source: &CStr) -> Result<Shader, String> {
-        Shader::from_source(source, gl::VERTEX_SHADER)
+        Shader::new(source, gl::VERTEX_SHADER)
     }
 
     pub fn from_frag_source(source: &CStr) -> Result<Shader, String> {
-        Shader::from_source(source, gl::FRAGMENT_SHADER)
+        Shader::new(source, gl::FRAGMENT_SHADER)
     }
 }
 
@@ -93,33 +117,30 @@ impl Drop for Shader {
     }
 }
 
-fn shader_from_source(source: &CStr, kind: gl::types::GLuint) -> Result<gl::types::GLuint, String> {
-    // create shader and get reference
-    let id = unsafe { gl::CreateShader(kind) };
+pub struct VertexBuffer {
+    pub id: gl::types::GLuint,
+}
 
-    unsafe {
-        // set the source code in the referenced shader with the input source
-        gl::ShaderSource(id, 1, &source.as_ptr(), std::ptr::null());
-        gl::CompileShader(id);
+impl VertexBuffer {
+    pub fn new(vertex_data: Vec<f32>) -> Result<Self, String> {
+        let mut id: gl::types::GLuint = 0;
+        unsafe {
+            gl::GenBuffers(1, &mut id);
+            gl::BindBuffer(gl::ARRAY_BUFFER, id);
+            gl::BufferData(
+                gl::ARRAY_BUFFER, // what type of buffer
+                (vertex_data.len() * std::mem::size_of::<f32>()) as gl::types::GLsizeiptr, // size of data in bytes
+                vertex_data.as_ptr() as *const gl::types::GLvoid, // pointer to data
+                gl::STATIC_DRAW, // usage
+            );
 
-        // get the compile status of the shader
-        let mut success: gl::types::GLint = 1;
-        gl::GetShaderiv(id, gl::COMPILE_STATUS, &mut success);
-
-        if success == 0 {
-            // if compile failed get length of error in shader
-            let mut error_length: gl::types::GLint = 0;
-            gl::GetShaderiv(id, gl::INFO_LOG_LENGTH, &mut error_length);
-
-            let error = create_whitespace_c_string(error_length as usize);
-
-            // fill error with info log in shader
-            gl::GetShaderInfoLog(id, error_length, std::ptr::null_mut(), error.as_ptr() as *mut gl::types::GLchar);
-            return Err(error.to_string_lossy().into_owned());
+            // unbind as it is no longer be changed
+            gl::BindBuffer(gl::ARRAY_BUFFER, 0);
         }
+        return Ok(Self {
+            id
+        });
     }
-
-    return Ok(id);
 }
 
 fn create_whitespace_c_string(length: usize) -> CString {

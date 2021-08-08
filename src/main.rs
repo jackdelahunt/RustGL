@@ -55,21 +55,7 @@ fn main() {
         0.0, 0.5, 0.0,     0.0, 0.0, 1.0,
     ];
 
-    // creating buffer object to that stores vertex data
-    let mut vbo: gl::types::GLuint = 0;
-    unsafe {
-        gl::GenBuffers(1, &mut vbo);
-        gl::BindBuffer(gl::ARRAY_BUFFER, vbo);
-        gl::BufferData(
-            gl::ARRAY_BUFFER, // what type of buffer
-            (vertices.len() * std::mem::size_of::<f32>()) as gl::types::GLsizeiptr, // size of data in bytes
-            vertices.as_ptr() as *const gl::types::GLvoid, // pointer to data
-            gl::STATIC_DRAW, // usage
-        );
-
-        // unbind as it is no longer be changed
-        gl::BindBuffer(gl::ARRAY_BUFFER, 0);
-    }
+    let vertex_buffer = render_gl::VertexBuffer::new(vertices).unwrap();
 
     // creating vertex array that uses buffered data
     let mut vao: gl::types::GLuint = 0;
@@ -78,7 +64,7 @@ fn main() {
         gl::BindVertexArray(vao);
 
         // link buffer data to this vertex array
-        gl::BindBuffer(gl::ARRAY_BUFFER, vbo);
+        gl::BindBuffer(gl::ARRAY_BUFFER, vertex_buffer.id);
         gl::EnableVertexAttribArray(0);
         gl::VertexAttribPointer(
             0, // index of the generic vertex attribute
