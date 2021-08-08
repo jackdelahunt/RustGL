@@ -49,44 +49,28 @@ fn main() {
     ).unwrap();
 
     let vertices: Vec<f32> = vec![
+        // main triangle
         // positions       // colours
         -0.5, -0.5, 0.0,   1.0, 0.0, 0.0,
         0.5, -0.5, 0.0,    0.0, 1.0, 0.0,
         0.0, 0.5, 0.0,     0.0, 0.0, 1.0,
+
+        // right triangle
+        0.5, -0.5, 0.0,    0.0, 1.0, 0.0,
+        0.5, 0.5, 0.0,     1.0, 0.0, 0.0,
+        0.0, 0.5, 0.0,     0.0, 0.0, 1.0,
+
+        // left triangle
+        0.0, 0.5, 0.0,     0.0, 0.0, 1.0,
+        -0.5, -0.5, 0.0,    1.0, 0.0, 0.0,
+        -0.5, 0.5, 0.0,     0.0, 1.0, 0.0,
     ];
 
     let vertex_buffer = render_gl::VertexBuffer::new(vertices).unwrap();
 
-    // creating vertex array that uses buffered data
-    let mut vao: gl::types::GLuint = 0;
-    unsafe {
-        gl::GenVertexArrays(1, &mut vao);
-        gl::BindVertexArray(vao);
-
-        // link buffer data to this vertex array
-        gl::BindBuffer(gl::ARRAY_BUFFER, vertex_buffer.id);
-        gl::EnableVertexAttribArray(0);
-        gl::VertexAttribPointer(
-            0, // index of the generic vertex attribute
-            3, // the number of components per vertex
-            gl::FLOAT, // data type
-            gl::FALSE, // normalized (int-to-float conversion)
-            (6 * std::mem::size_of::<f32>()) as gl::types::GLint, // stride (byte offset between attributes)
-            std::ptr::null()); // offset of the first component
-
-        gl::EnableVertexAttribArray(1);
-        gl::VertexAttribPointer(
-            1, // index of the generic vertex attribute
-            3, // the number of components per vertex
-            gl::FLOAT, // data type
-            gl::FALSE, // normalized (int-to-float conversion)
-            (6 * std::mem::size_of::<f32>()) as gl::types::GLint, // stride (byte offset between attributes)
-            (3 * std::mem::size_of::<f32>()) as *const gl::types::GLvoid); // offset of the first component
-
-        // unbind everything as they are no longer be changed
-        gl::BindBuffer(gl::ARRAY_BUFFER, 0);
-        gl::BindVertexArray(0);
-    }
+    let vertex_array = render_gl::VertexArray::new(&vertex_buffer).unwrap();
+    vertex_array.attribute(0, 3, 6, 0);
+    vertex_array.attribute(1, 3, 6, 3);
 
     let mut event_pump = sdl.event_pump().unwrap();
     'main_loop: loop {
@@ -108,11 +92,11 @@ fn main() {
 
         shader_program.set_used();
         unsafe {
-            gl::BindVertexArray(vao);
+            gl::BindVertexArray(vertex_array.id);
             gl::DrawArrays(
                 gl::TRIANGLES, // mode
                 0, // starting index in the enabled arrays
-                3 // number of indices to be rendered
+                9 // number of indices to be rendered
             );
         }
 

@@ -1,5 +1,6 @@
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, c_void};
 use std;
+use sdl2::video::GLProfile::GLES;
 
 pub struct Program {
     pub id: gl::types::GLuint
@@ -140,6 +141,46 @@ impl VertexBuffer {
         return Ok(Self {
             id
         });
+    }
+}
+
+pub struct VertexArray {
+    pub id: gl::types::GLuint
+}
+
+impl VertexArray {
+    pub fn new(vertex_buffer: &VertexBuffer) -> Result<Self, String> {
+        let mut id: gl::types::GLuint = 0;
+        unsafe {
+            gl::GenVertexArrays(1, &mut id);
+            gl::BindVertexArray(id);
+            gl::BindBuffer(gl::ARRAY_BUFFER, vertex_buffer.id);
+            gl::BindVertexArray(0);
+        }
+
+        return Ok(Self {id})
+    }
+
+    pub fn attribute(&self, index: u32, components: i32, stride: usize, offset: usize) -> () {
+        unsafe {
+            gl::BindVertexArray(self.id);
+
+            let mut offset_ptr = std::ptr::null();
+            if offset != 0 {
+                offset_ptr = (offset * std::mem::size_of::<f32>()) as *const gl::types::GLvoid;
+            }
+
+            gl::EnableVertexAttribArray(index);
+            gl::VertexAttribPointer(
+                index,
+                components,
+                gl::FLOAT,
+                gl::FALSE, // normalized (int-to-float conversion)
+                (stride * std::mem::size_of::<f32>()) as gl::types::GLint, // stride (byte offset between attributes)
+                offset_ptr); // offset of the first component
+
+            gl::BindVertexArray(0);
+        }
     }
 }
 
