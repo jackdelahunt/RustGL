@@ -1,0 +1,9 @@
+[package]
+name = "render"
+version = "0.1.0"
+authors = ["jackdelahunt <jdelahun@redhat.com>"]
+edition = "2018"
+
+[dependencies]
+sdl2 = "0.34.5"
+gl = "0.10.0"
