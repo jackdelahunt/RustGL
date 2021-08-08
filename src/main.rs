@@ -6,6 +6,7 @@ use sdl2::event::Event;
 use std::ffi::CString;
 use renderer::vertex_buffer::VertexBuffer;
 use renderer::vertex_array::VertexArray;
+use renderer::index_array::IndexArray;
 use renderer::shader::Shader;
 use renderer::program::Program;
 
@@ -54,13 +55,15 @@ fn main() {
 
     let vertices: Vec<f32> = vec![
         // unique vertices     // colours
-        0.0, 0.5, 0.0,         1.0, 0.0, 0.0,
-        0.5, -0.5, 0.0,        0.0, 1.0, 0.0,
-        -0.5, -0.5, 0.0,       0.0, 0.0, 1.0,
+        0.0, 1.0, 0.0,         1.0, 0.0, 0.0, // top
+        0.5, 0.0, 0.0,        0.0, 1.0, 0.0, // right
+        -0.5, 0.0, 0.0,       0.0, 0.0, 1.0, // left
+        0.0, -1.0, 0.0,       1.0, 1.0, 0.0, // bottom
     ];
 
     let indices: Vec<i32> = vec![
         0, 1, 2,
+        1, 2, 3
     ];
 
     let vertex_buffer = VertexBuffer::new(vertices).unwrap();
@@ -68,7 +71,8 @@ fn main() {
     let vertex_array = VertexArray::new(&vertex_buffer).unwrap();
     vertex_array.attribute(0, 3, 6, 0);
     vertex_array.attribute(1, 3, 6, 3);
-    vertex_array.bind_element_array(&indices);
+
+    let index_array = IndexArray::new(&indices);
 
     let mut event_pump = sdl.event_pump().unwrap();
 
@@ -91,9 +95,9 @@ fn main() {
 
         shader_program.set_used();
         unsafe {
-            gl::BindVertexArray(vertex_array.id);
-            gl::DrawElements(gl::TRIANGLES, 3, gl::UNSIGNED_INT, indices.as_ptr() as *const gl::types::GLvoid);
-            gl::BindVertexArray(0);
+            vertex_array.bind();
+            gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, indices.as_ptr() as *const gl::types::GLvoid);
+            vertex_array.unbind();
         }
 
         window.gl_swap_window();
