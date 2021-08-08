@@ -50,6 +50,16 @@ impl Program {
         };
     }
 
+    pub fn set_uniform_vec4(&self, uniform_name: &str, x: f32, y: f32, z: f32, w: f32) {
+        let cstr = CString::new(uniform_name).unwrap();
+        let char_ptr = cstr.as_ptr();
+
+        unsafe {
+            let location = gl::GetUniformLocation(self.id, char_ptr);
+            gl::Uniform4f(location, x, y, z, w);
+        }
+    }
+
     pub fn set_used(&self) {
         unsafe {
             gl::UseProgram(self.id);

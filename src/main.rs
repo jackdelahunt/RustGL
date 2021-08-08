@@ -69,6 +69,11 @@ fn main() {
     vertex_array.bind_element_array(&indices);
 
     let mut event_pump = sdl.event_pump().unwrap();
+
+    let mut r_time: f32 = 0.0;
+    let mut g_time: f32 = 0.0;
+    let mut b_time: f32 = 0.0;
+
     'main_loop: loop {
         for event in event_pump.poll_iter() {
             match event {
@@ -86,7 +91,18 @@ fn main() {
             gl::Clear(gl::COLOR_BUFFER_BIT);
         }
 
+        r_time += 0.1;
+        g_time += 0.15;
+        b_time += 0.2;
+
         shader_program.set_used();
+        shader_program.set_uniform_vec4(
+            "ourColour",
+            (r_time.sin() / 2.0) + 0.5,
+            ((g_time + 0.15).sin() / 2.0) + 0.5,
+            ((b_time + 0.82).sin() / 2.0) + 0.5,
+            0.0);
+
         unsafe {
             gl::BindVertexArray(vertex_array.id);
             gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, indices.as_ptr() as *const gl::types::GLvoid);

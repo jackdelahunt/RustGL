@@ -1,12 +1,11 @@
 #version 330 core
 
-in VS_OUTPUT {
-    vec3 Colour;
-} IN;
+in vec3 vertexColour;
+out vec4 colour;
 
-out vec4 Colour;
+uniform vec4 ourColour;
 
 void main()
 {
-    Colour = vec4(IN.Colour, 1.0f);
+    colour = ourColour;
 }
