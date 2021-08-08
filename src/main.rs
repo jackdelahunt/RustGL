@@ -7,6 +7,7 @@ use std::ffi::CString;
 use renderer::vertex_buffer::VertexBuffer;
 use renderer::vertex_array::VertexArray;
 use renderer::index_array::IndexArray;
+use renderer::texture::Texture;
 use renderer::shader::Shader;
 use renderer::program::Program;
 
@@ -54,28 +55,30 @@ fn main() {
     ).unwrap();
 
     let vertices: Vec<f32> = vec![
-        // unique vertices     // colours
-        0.0, 1.0, 0.0,         1.0, 0.0, 0.0, // top
-        0.5, 0.0, 0.0,        0.0, 1.0, 0.0, // right
-        -0.5, 0.0, 0.0,       0.0, 0.0, 1.0, // left
-        0.0, -1.0, 0.0,       1.0, 1.0, 0.0, // bottom
+        // unique vertices     // colours         // texture coords
+        -1.0, 1.0, 0.0,       1.0, 1.0, 0.0,      0.0, 1.0,           // top left
+        -1.0, -1.0, 0.0,       0.0, 0.0, 1.0,      0.0, 0.0,          // bottom left
+        1.0, -1.0, 0.0,        0.0, 1.0, 0.0,      1.0, 0.0,          // bottom right
+        1.0, 1.0, 0.0,         1.0, 0.0, 0.0,     1.0, 1.0,          // top right
     ];
 
     let indices: Vec<i32> = vec![
         0, 1, 2,
-        1, 2, 3
+        2, 3, 0
     ];
 
     let vertex_buffer = VertexBuffer::new(vertices).unwrap();
 
     let vertex_array = VertexArray::new(&vertex_buffer).unwrap();
-    vertex_array.attribute(0, 3, 6, 0);
-    vertex_array.attribute(1, 3, 6, 3);
+    vertex_array.attribute(0, 3, 8, 0);
+    vertex_array.attribute(1, 3, 8, 3);
+    vertex_array.attribute(2, 2, 8, 6);
 
-    let index_array = IndexArray::new(&indices);
+    let _index_array = IndexArray::new(&indices);
+
+    let face_texture = Texture::new("res/face.png").unwrap();
 
     let mut event_pump = sdl.event_pump().unwrap();
-
     'main_loop: loop {
         for event in event_pump.poll_iter() {
             match event {
@@ -91,13 +94,14 @@ fn main() {
             // set pixels on screen to the colour set with ClearColor as
             // indicated with the COLOR_BUFFER_BIT, could be depth or bit
             gl::Clear(gl::COLOR_BUFFER_BIT);
-        }
 
-        shader_program.set_used();
-        unsafe {
+
+            shader_program.set_used();
+            face_texture.bind();
             vertex_array.bind();
             gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, indices.as_ptr() as *const gl::types::GLvoid);
             vertex_array.unbind();
+            face_texture.unbind();
         }
 
         window.gl_swap_window();

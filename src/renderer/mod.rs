@@ -3,6 +3,7 @@ pub mod vertex_array;
 pub mod program;
 pub mod shader;
 pub mod index_array;
+pub mod texture;
 
 use std::ffi::CString;
 use std;
