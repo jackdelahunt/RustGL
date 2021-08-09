@@ -4,7 +4,7 @@ extern crate  nalgebra_glm as glm;
 
 pub mod renderer;
 
-use sdl2::event::Event;
+use sdl2::event::{Event, WindowEvent};
 use std::ffi::CString;
 use renderer::Renderer;
 use renderer::vertex_buffer::VertexBuffer;
@@ -96,6 +96,13 @@ fn main() {
         for event in event_pump.poll_iter() {
             match event {
                 Event::Quit{..} => break 'main_loop,
+                Event::Window {win_event, ..} => {
+                    if let WindowEvent::Resized(width, height) = win_event {
+                        unsafe {
+                            gl::Viewport(0, 0, width, height)
+                        }
+                    }
+                }
                 _ => {}
             }
         }
