@@ -71,6 +71,16 @@ impl Program {
         }
     }
 
+    pub fn set_uniform_matrix_4f(&self, uniform_name: &str, matrix: &glm::Mat4) {
+        let cstr = CString::new(uniform_name).unwrap();
+        let char_ptr = cstr.as_ptr();
+
+        unsafe {
+            let location = gl::GetUniformLocation(self.id, char_ptr);
+            gl::UniformMatrix4fv(location, 1, gl::FALSE, glm::value_ptr(matrix).as_ptr());
+        }
+    }
+
     pub fn set_used(&self) {
         unsafe {
             gl::UseProgram(self.id);

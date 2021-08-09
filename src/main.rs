@@ -1,5 +1,7 @@
 extern crate sdl2;
 extern crate gl;
+extern crate  nalgebra_glm as glm;
+
 pub mod renderer;
 
 use sdl2::event::Event;
@@ -79,6 +81,7 @@ fn main() {
     let face_1_texture = Texture::new("res/face.png").unwrap();
     let face_2_texture = Texture::new("res/face_2.png").unwrap();
 
+    let mut trans: glm::Mat4 = glm::identity();
     shader_program.set_used();
     shader_program.set_uniform_1i("texture_sample_1", 0);
     shader_program.set_uniform_1i("texture_sample_2", 1);
@@ -87,19 +90,18 @@ fn main() {
     'main_loop: loop {
         for event in event_pump.poll_iter() {
             match event {
-                Event::Quit{timestamp} => {
-                    println!("{}", timestamp);
-                    break 'main_loop;
-                },
+                Event::Quit{timestamp} => break 'main_loop,
                 _ => {}
             }
         }
+
+        trans = glm::rotate(&trans, 0.01, &glm::make_vec3(&[0.0, 0.0, 1.0]));
+        shader_program.set_uniform_matrix_4f("transform", &trans);
 
         unsafe {
             // set pixels on screen to the colour set with ClearColor as
             // indicated with the COLOR_BUFFER_BIT, could be depth or bit
             gl::Clear(gl::COLOR_BUFFER_BIT);
-
 
             shader_program.set_used();
             face_1_texture.bind_to_slot(0);
