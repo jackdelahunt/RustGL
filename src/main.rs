@@ -89,7 +89,8 @@ fn main() {
 
     shader_program.set_uniform_1i("texture_sample_1", 0);
     shader_program.set_uniform_1i("texture_sample_2", 1);
-    // let mut trans: glm::Mat4 = glm::identity();
+
+    let mut trans: glm::Mat4 = glm::identity();
 
     let mut event_pump = sdl.event_pump().unwrap();
     'main_loop: loop {
@@ -107,8 +108,8 @@ fn main() {
             }
         }
 
-        // trans = glm::rotate(&trans, 0.01, &glm::make_vec3(&[0.0, 0.0, 1.0]));
-        // shader_program.set_uniform_matrix_4f("transform", &trans);
+        trans = glm::rotate(&trans, 0.01, &glm::make_vec3(&[0.0, 0.0, 1.0]));
+        shader_program.set_uniform_matrix_4f("transformation", &trans);
         renderer.clear();
         renderer.draw(&vertex_array, &index_array, &shader_program);
         window.gl_swap_window();

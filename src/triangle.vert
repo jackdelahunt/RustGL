@@ -6,11 +6,11 @@ layout (location = 2) in vec2 texture_data;
 out vec3 colour;
 out vec2 texture_data_frag;
 
-// uniform mat4 transform;
+uniform mat4 transformation;
 
 void main()
 {
-    gl_Position = vec4(position_data, 1.0);
+    gl_Position = vec4(position_data, 1.0) * transformation;
     colour = colour_data;
     texture_data_frag = texture_data;
 }
