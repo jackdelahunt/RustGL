@@ -76,7 +76,12 @@ fn main() {
 
     let _index_array = IndexArray::new(&indices);
 
-    let face_texture = Texture::new("res/face.png").unwrap();
+    let face_1_texture = Texture::new("res/face.png").unwrap();
+    let face_2_texture = Texture::new("res/face_2.png").unwrap();
+
+    shader_program.set_used();
+    shader_program.set_uniform_1i("texture_sample_1", 0);
+    shader_program.set_uniform_1i("texture_sample_2", 1);
 
     let mut event_pump = sdl.event_pump().unwrap();
     'main_loop: loop {
@@ -97,11 +102,13 @@ fn main() {
 
 
             shader_program.set_used();
-            face_texture.bind();
+            face_1_texture.bind_to_slot(0);
+            face_2_texture.bind_to_slot(1);
             vertex_array.bind();
             gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, indices.as_ptr() as *const gl::types::GLvoid);
             vertex_array.unbind();
-            face_texture.unbind();
+            face_2_texture.unbind();
+            face_1_texture.unbind();
         }
 
         window.gl_swap_window();
