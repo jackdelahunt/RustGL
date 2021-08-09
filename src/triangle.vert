@@ -4,13 +4,13 @@ layout (location = 1) in vec3 colour_data;
 layout (location = 2) in vec2 texture_data;
 
 out vec3 colour;
-out vec2 text_coord;
+out vec2 texture_data_frag;
 
-uniform mat4 transform;
+// uniform mat4 transform;
 
 void main()
 {
-    gl_Position = transform * vec4(position_data, 1.0);
+    gl_Position = vec4(position_data, 1.0);
     colour = colour_data;
-    text_coord = texture_data;
+    texture_data_frag = texture_data;
 }

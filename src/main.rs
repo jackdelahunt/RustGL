@@ -6,6 +6,7 @@ pub mod renderer;
 
 use sdl2::event::Event;
 use std::ffi::CString;
+use renderer::Renderer;
 use renderer::vertex_buffer::VertexBuffer;
 use renderer::vertex_array::VertexArray;
 use renderer::index_array::IndexArray;
@@ -58,9 +59,9 @@ fn main() {
 
     let vertices: Vec<f32> = vec![
         // unique vertices     // colours         // texture coords
-        -1.0, 1.0, 0.0,       1.0, 1.0, 0.0,      0.0, 1.0,           // top left
-        -1.0, -1.0, 0.0,       0.0, 0.0, 1.0,      0.0, 0.0,          // bottom left
-        1.0, -1.0, 0.0,        0.0, 1.0, 0.0,      1.0, 0.0,          // bottom right
+        -1.0, 1.0, 0.0,       1.0, 1.0, 0.0,      0.0, 1.0,          // top left
+        -1.0, -1.0, 0.0,       0.0, 0.0, 1.0,     0.0, 0.0,          // bottom left
+        1.0, -1.0, 0.0,        0.0, 1.0, 0.0,     1.0, 0.0,          // bottom right
         1.0, 1.0, 0.0,         1.0, 0.0, 0.0,     1.0, 1.0,          // top right
     ];
 
@@ -76,43 +77,33 @@ fn main() {
     vertex_array.attribute(1, 3, 8, 3);
     vertex_array.attribute(2, 2, 8, 6);
 
-    let _index_array = IndexArray::new(&indices);
+    let index_array = IndexArray::new(indices).unwrap();
+
+    let renderer = Renderer::new();
 
     let face_1_texture = Texture::new("res/face.png").unwrap();
     let face_2_texture = Texture::new("res/face_2.png").unwrap();
 
-    let mut trans: glm::Mat4 = glm::identity();
-    shader_program.set_used();
+    face_1_texture.bind_to_slot(0);
+    face_2_texture.bind_to_slot(1);
+
     shader_program.set_uniform_1i("texture_sample_1", 0);
     shader_program.set_uniform_1i("texture_sample_2", 1);
+    // let mut trans: glm::Mat4 = glm::identity();
 
     let mut event_pump = sdl.event_pump().unwrap();
     'main_loop: loop {
         for event in event_pump.poll_iter() {
             match event {
-                Event::Quit{timestamp} => break 'main_loop,
+                Event::Quit{..} => break 'main_loop,
                 _ => {}
             }
         }
 
-        trans = glm::rotate(&trans, 0.01, &glm::make_vec3(&[0.0, 0.0, 1.0]));
-        shader_program.set_uniform_matrix_4f("transform", &trans);
-
-        unsafe {
-            // set pixels on screen to the colour set with ClearColor as
-            // indicated with the COLOR_BUFFER_BIT, could be depth or bit
-            gl::Clear(gl::COLOR_BUFFER_BIT);
-
-            shader_program.set_used();
-            face_1_texture.bind_to_slot(0);
-            face_2_texture.bind_to_slot(1);
-            vertex_array.bind();
-            gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, indices.as_ptr() as *const gl::types::GLvoid);
-            vertex_array.unbind();
-            face_2_texture.unbind();
-            face_1_texture.unbind();
-        }
-
+        // trans = glm::rotate(&trans, 0.01, &glm::make_vec3(&[0.0, 0.0, 1.0]));
+        // shader_program.set_uniform_matrix_4f("transform", &trans);
+        renderer.clear();
+        renderer.draw(&vertex_array, &index_array, &shader_program);
         window.gl_swap_window();
     }
 }

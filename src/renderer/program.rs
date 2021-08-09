@@ -62,6 +62,7 @@ impl Program {
     }
 
     pub fn set_uniform_1i(&self, uniform_name: &str, x: i32) {
+        self.bind();
         let cstr = CString::new(uniform_name).unwrap();
         let char_ptr = cstr.as_ptr();
 
@@ -69,6 +70,7 @@ impl Program {
             let location = gl::GetUniformLocation(self.id, char_ptr);
             gl::Uniform1i(location, x);
         }
+        self.unbind();
     }
 
     pub fn set_uniform_matrix_4f(&self, uniform_name: &str, matrix: &glm::Mat4) {
@@ -81,9 +83,15 @@ impl Program {
         }
     }
 
-    pub fn set_used(&self) {
+    pub fn bind(&self) {
         unsafe {
             gl::UseProgram(self.id);
+        }
+    }
+
+    pub fn unbind(&self) {
+        unsafe {
+            gl::UseProgram(0);
         }
     }
 }
