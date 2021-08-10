@@ -6,3 +6,4 @@ A renderer that uses openGL and SDL2. The current progress can be seen here.
 - Vertex shaders
 - Fragment shaders
 - Textures
+- 3D
