@@ -72,13 +72,18 @@ fn main() {
     shader_program.set_uniform_1i("texture_sample_1", 0);
 
     let mut model: glm::Mat4 = glm::identity();
-    //model = glm::rotate(&model, f32::to_radians(90.0), &glm::make_vec3(&[1.0, 0.0, 0.0])); // local coords to world coords
 
     let mut view: glm::Mat4 = glm::identity();
-    view  = glm::translate(&view, &glm::make_vec3(&[0.0, 0.0, -3.0])); // world coords to view coords, moving increase of camera
+    view  = glm::translate(&view, &glm::make_vec3(&[0.0, 0.0, -8.0])); // world coords to view coords, moving increase of camera
 
     let mut projection: glm::Mat4 = glm::perspective(f32::to_radians(45.0), 800.5 / 600.0, 0.1, 100.0);
 
+    let cube_positions = vec![
+        glm::make_vec3(&[0.0, 0.0, 0.0]),
+        glm::make_vec3(&[6.0, 8.0, -10.0]),
+        glm::make_vec3(&[-5.0, -2.2, -2.5]),
+        glm::make_vec3(&[2.0, -2.2, 2.0]),
+    ];
 
     let mut event_pump = sdl.event_pump().unwrap();
     'main_loop: loop {
@@ -96,15 +101,17 @@ fn main() {
             }
         }
 
-        model = glm::rotate(&model, f32::to_radians(1.0), &glm::make_vec3(&[1.0, 1.0, 0.0])); // local coords to world coords
-
-
-        shader_program.set_uniform_matrix_4f("model", &model);
         shader_program.set_uniform_matrix_4f("view", &view);
         shader_program.set_uniform_matrix_4f("projection", &projection);
 
         renderer.clear();
-        renderer.draw(&vertex_array, &shader_program);
+
+        for pos in &cube_positions {
+            model = glm::identity();
+            model = glm::translate(&model, pos);
+            shader_program.set_uniform_matrix_4f("model", &model);
+            renderer.draw(&vertex_array, &shader_program);
+        }
         window.gl_swap_window();
     }
 }
