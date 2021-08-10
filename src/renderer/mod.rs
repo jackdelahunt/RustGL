@@ -15,9 +15,22 @@ pub struct Renderer {}
 
 impl Renderer {
     pub fn new() -> Self {
+        unsafe {
+            gl::Enable(gl::DEPTH_TEST);
+        }
         return Self {};
     }
-    pub fn draw(&self, vertex_array: &VertexArray, index_array: &IndexArray, shader_program: &Program) {
+
+    pub fn draw(&self, vertex_array: &VertexArray, shader_program: &Program) {
+        shader_program.bind();
+        vertex_array.bind();
+        unsafe {
+            gl::DrawArrays(gl::TRIANGLES, 0, 36);
+        }
+        vertex_array.unbind();
+    }
+
+    pub fn draw_with_index(&self, vertex_array: &VertexArray, index_array: &IndexArray, shader_program: &Program) {
         shader_program.bind();
         vertex_array.bind();
         unsafe {
@@ -29,6 +42,7 @@ impl Renderer {
     pub fn clear(&self) {
         unsafe {
             gl::Clear(gl::COLOR_BUFFER_BIT);
+            gl::Clear(gl::DEPTH_BUFFER_BIT);
         }
     }
 }

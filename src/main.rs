@@ -24,7 +24,7 @@ fn main() {
     gl_attribute.set_context_version(4, 5);
 
     // create window
-    let window = video_subsystem.window("Game", 810, 540)
+    let window = video_subsystem.window("Game", 700, 700)
         .opengl()
         .resizable()
         .build()
@@ -38,8 +38,8 @@ fn main() {
 
     // set the gl clear colour to something new
     unsafe {
-        gl::Viewport(0, 0, 810, 540);
-        gl::ClearColor(1.0, 1.0, 1.0, 1.0);
+        gl::Viewport(0, 0, 700, 700);
+        gl::ClearColor(0.2, 0.2, 0.7, 1.0);
     }
 
     // create vertex shader form source
@@ -58,39 +58,71 @@ fn main() {
     ).unwrap();
 
     let vertices: Vec<f32> = vec![
-        // unique vertices     // colours         // texture coords
-        -1.0, 1.0, 0.0,       1.0, 1.0, 0.0,      0.0, 1.0,          // top left
-        -1.0, -1.0, 0.0,       0.0, 0.0, 1.0,     0.0, 0.0,          // bottom left
-        1.0, -1.0, 0.0,        0.0, 1.0, 0.0,     1.0, 0.0,          // bottom right
-        1.0, 1.0, 0.0,         1.0, 0.0, 0.0,     1.0, 1.0,          // top right
-    ];
+        // vertex data          // texture
+        -0.5, -0.5, -0.5,       0.0, 0.0,
+        0.5, -0.5, -0.5,        1.0, 0.0,
+        0.5,  0.5, -0.5,        1.0, 1.0,
+        0.5,  0.5, -0.5,        1.0, 1.0,
+        -0.5,  0.5, -0.5,       0.0, 1.0,
+        -0.5, -0.5, -0.5,       0.0, 0.0,
 
-    let indices: Vec<i32> = vec![
-        0, 1, 2,
-        2, 3, 0
+        -0.5, -0.5,  0.5,       0.0, 0.0,
+        0.5, -0.5,  0.5,        1.0, 0.0,
+        0.5,  0.5,  0.5,        1.0, 1.0,
+        0.5,  0.5,  0.5,        1.0, 1.0,
+        -0.5,  0.5,  0.5,       0.0, 1.0,
+        -0.5, -0.5,  0.5,       0.0, 0.0,
+
+        -0.5,  0.5,  0.5,       1.0, 0.0,
+        -0.5,  0.5, -0.5,       1.0, 1.0,
+        -0.5, -0.5, -0.5,       0.0, 1.0,
+        -0.5, -0.5, -0.5,       0.0, 1.0,
+        -0.5, -0.5,  0.5,       0.0, 0.0,
+        -0.5,  0.5,  0.5,       1.0, 0.0,
+
+        0.5,  0.5,  0.5,        1.0, 0.0,
+        0.5,  0.5, -0.5,        1.0, 1.0,
+        0.5, -0.5, -0.5,        0.0, 1.0,
+        0.5, -0.5, -0.5,        0.0, 1.0,
+        0.5, -0.5,  0.5,        0.0, 0.0,
+        0.5,  0.5,  0.5,        1.0, 0.0,
+
+        -0.5, -0.5, -0.5,       0.0, 1.0,
+        0.5, -0.5, -0.5,        1.0, 1.0,
+        0.5, -0.5,  0.5,        1.0, 0.0,
+        0.5, -0.5,  0.5,        1.0, 0.0,
+        -0.5, -0.5,  0.5,       0.0, 0.0,
+        -0.5, -0.5, -0.5,       0.0, 1.0,
+
+        -0.5,  0.5, -0.5,        0.0, 1.0,
+        0.5,  0.5, -0.5,        1.0, 1.0,
+        0.5,  0.5,  0.5,        1.0, 0.0,
+        0.5,  0.5,  0.5,        1.0, 0.0,
+        -0.5,  0.5,  0.5,       0.0, 0.0,
+        -0.5,  0.5, -0.5,       0.0, 1.0
     ];
 
     let vertex_buffer = VertexBuffer::new(vertices).unwrap();
 
     let vertex_array = VertexArray::new(&vertex_buffer).unwrap();
-    vertex_array.attribute(0, 3, 8, 0);
-    vertex_array.attribute(1, 3, 8, 3);
-    vertex_array.attribute(2, 2, 8, 6);
-
-    let index_array = IndexArray::new(indices).unwrap();
+    vertex_array.attribute(0, 3, 5, 0);
+    vertex_array.attribute(1, 2, 5, 3);
 
     let renderer = Renderer::new();
 
     let face_1_texture = Texture::new("res/face.png").unwrap();
-    let face_2_texture = Texture::new("res/face_2.png").unwrap();
-
     face_1_texture.bind_to_slot(0);
-    face_2_texture.bind_to_slot(1);
 
     shader_program.set_uniform_1i("texture_sample_1", 0);
-    shader_program.set_uniform_1i("texture_sample_2", 1);
 
-    let mut trans: glm::Mat4 = glm::identity();
+    let mut model: glm::Mat4 = glm::identity();
+    //model = glm::rotate(&model, f32::to_radians(90.0), &glm::make_vec3(&[1.0, 0.0, 0.0])); // local coords to world coords
+
+    let mut view: glm::Mat4 = glm::identity();
+    view  = glm::translate(&view, &glm::make_vec3(&[0.0, 0.0, -3.0])); // world coords to view coords, moving increase of camera
+
+    let mut projection: glm::Mat4 = glm::perspective(f32::to_radians(45.0), 800.5 / 600.0, 0.1, 100.0);
+
 
     let mut event_pump = sdl.event_pump().unwrap();
     'main_loop: loop {
@@ -108,10 +140,15 @@ fn main() {
             }
         }
 
-        trans = glm::rotate(&trans, 0.01, &glm::make_vec3(&[0.0, 0.0, 1.0]));
-        shader_program.set_uniform_matrix_4f("transformation", &trans);
+        model = glm::rotate(&model, f32::to_radians(1.0), &glm::make_vec3(&[1.0, 1.0, 0.0])); // local coords to world coords
+
+
+        shader_program.set_uniform_matrix_4f("model", &model);
+        shader_program.set_uniform_matrix_4f("view", &view);
+        shader_program.set_uniform_matrix_4f("projection", &projection);
+
         renderer.clear();
-        renderer.draw(&vertex_array, &index_array, &shader_program);
+        renderer.draw(&vertex_array, &shader_program);
         window.gl_swap_window();
     }
 }
