@@ -14,6 +14,15 @@ use renderer::index_array::IndexArray;
 use renderer::texture::Texture;
 use renderer::shader::Shader;
 use renderer::program::Program;
+use glm::{TVec3, Mat4};
+use sdl2::keyboard::Keycode;
+
+static UP: TVec3<f32> = TVec3::new(0.0, 1.0, 0.0);
+static DOWN: TVec3<f32> = TVec3::new(0.0, -1.0, 0.0);
+static FRONT: TVec3<f32> = TVec3::new(0.0, 0.0, -1.0);  // opengl left hand
+static BACK: TVec3<f32> = TVec3::new(0.0, 0.0, 1.0);    // opengl left hand
+static RIGHT: TVec3<f32> = TVec3::new(1.0, 0.0, 0.0);
+static LEFT: TVec3<f32> = TVec3::new(-1.0, 0.0, 0.0);
 
 fn main() {
     let sdl = sdl2::init().unwrap();
@@ -73,31 +82,61 @@ fn main() {
 
     shader_program.set_uniform_1i("texture_sample_1", 0);
 
-    let mut model: glm::Mat4 = glm::identity();
-    model = glm::rotate(&model, f32::to_radians(45.0), &glm::make_vec3(&[1.0, 0.0, 0.0]));
+    let mut camera_position = TVec3::new(0.0, 0.0, 6.0);
 
-    let mut view: glm::Mat4 = glm::identity();
+    let mut model: Mat4 = glm::identity();
 
-    let mut projection: glm::Mat4 = glm::perspective(f32::to_radians(45.0), 800.5 / 600.0, 0.1, 100.0);
-    projection = glm::translate(&projection, &glm::make_vec3(&[0.0, 0.0, -3.0]));
+    let mut view: Mat4 = glm::identity();
+    view = glm::look_at(
+        &camera_position,
+        &(&camera_position + &FRONT),
+        &UP,
+    );
+
+    let mut projection: Mat4 = glm::perspective(f32::to_radians(45.0), 800.5 / 600.0, 0.1, 100.0);
+    projection = glm::translate(&projection, &TVec3::new(0.0, 0.0, -3.0));
+
 
     let mut event_pump = sdl.event_pump().unwrap();
     'main_loop: loop {
         for event in event_pump.poll_iter() {
             match event {
-                Event::Quit{..} => break 'main_loop,
                 Event::Window {win_event, ..} => {
                     if let WindowEvent::Resized(width, height) = win_event {
                         unsafe {
                             gl::Viewport(0, 0, width, height)
                         }
                     }
+                },
+                Event::KeyDown {keycode, ..} => {
+                    match keycode {
+                        None => {}
+                        Some(code) => {
+                            match code {
+                                Keycode::A => camera_position = camera_position + LEFT,
+                                Keycode::D => camera_position = camera_position + RIGHT,
+                                Keycode::S => camera_position = camera_position + BACK,
+                                Keycode::W => camera_position = camera_position + FRONT,
+                                Keycode::Space => camera_position = camera_position + UP,
+                                Keycode::LShift => camera_position = camera_position + DOWN,
+                                _ => {}
+                            }
+                        }
+                    }
                 }
+                Event::Quit{..} => break 'main_loop,
                 _ => {}
             }
         }
 
-        view = glm::rotate(&view, f32::to_radians(1.0), &glm::make_vec3(&[0.0, 1.0, 0.0]));
+        model = glm::rotate(&model, f32::to_radians(1.5), &TVec3::new(1.0, 1.0, 1.0));
+
+        view = glm::look_at(
+            &camera_position,
+            &(&camera_position + &FRONT),
+            &UP,
+        );
+
         shader_program.set_uniform_matrix_4f("model", &model);
         shader_program.set_uniform_matrix_4f("view", &view);
         shader_program.set_uniform_matrix_4f("projection", &projection);
