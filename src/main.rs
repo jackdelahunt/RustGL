@@ -61,8 +61,10 @@ fn main() {
     let vertex_buffer = VertexBuffer::new(data::gen_cube_vertices()).unwrap();
 
     let vertex_array = VertexArray::new(&vertex_buffer).unwrap();
-    vertex_array.attribute(0, 3, 5, 0);
-    vertex_array.attribute(1, 2, 5, 3);
+    vertex_array.attribute(0, 3, 8, 0);
+    vertex_array.attribute(1, 2, 8, 3);
+    vertex_array.attribute(2, 3, 8, 5);
+
 
     let renderer = Renderer::new();
 
@@ -72,18 +74,12 @@ fn main() {
     shader_program.set_uniform_1i("texture_sample_1", 0);
 
     let mut model: glm::Mat4 = glm::identity();
+    model = glm::rotate(&model, f32::to_radians(45.0), &glm::make_vec3(&[1.0, 0.0, 0.0]));
 
     let mut view: glm::Mat4 = glm::identity();
-    view  = glm::translate(&view, &glm::make_vec3(&[0.0, 0.0, -8.0])); // world coords to view coords, moving increase of camera
 
     let mut projection: glm::Mat4 = glm::perspective(f32::to_radians(45.0), 800.5 / 600.0, 0.1, 100.0);
-
-    let cube_positions = vec![
-        glm::make_vec3(&[0.0, 0.0, 0.0]),
-        glm::make_vec3(&[6.0, 8.0, -10.0]),
-        glm::make_vec3(&[-5.0, -2.2, -2.5]),
-        glm::make_vec3(&[2.0, -2.2, 2.0]),
-    ];
+    projection = glm::translate(&projection, &glm::make_vec3(&[0.0, 0.0, -3.0]));
 
     let mut event_pump = sdl.event_pump().unwrap();
     'main_loop: loop {
@@ -101,17 +97,13 @@ fn main() {
             }
         }
 
+        view = glm::rotate(&view, f32::to_radians(1.0), &glm::make_vec3(&[0.0, 1.0, 0.0]));
+        shader_program.set_uniform_matrix_4f("model", &model);
         shader_program.set_uniform_matrix_4f("view", &view);
         shader_program.set_uniform_matrix_4f("projection", &projection);
 
         renderer.clear();
-
-        for pos in &cube_positions {
-            model = glm::identity();
-            model = glm::translate(&model, pos);
-            shader_program.set_uniform_matrix_4f("model", &model);
-            renderer.draw(&vertex_array, &shader_program);
-        }
+        renderer.draw(&vertex_array, &shader_program);
         window.gl_swap_window();
     }
 }
