@@ -4,6 +4,7 @@ extern crate  nalgebra_glm as glm;
 
 mod renderer;
 mod data;
+mod time;
 
 use sdl2::event::{Event, WindowEvent};
 use std::ffi::CString;
@@ -27,6 +28,8 @@ static LEFT: TVec3<f32> = TVec3::new(-1.0, 0.0, 0.0);
 fn main() {
     let sdl = sdl2::init().unwrap();
     let video_subsystem = sdl.video().unwrap();
+
+    let mut delta_timer = time::DeltaTimer::new();
 
     // specify gl versions
     let gl_attribute = video_subsystem.gl_attr();
@@ -96,9 +99,11 @@ fn main() {
     let mut projection: Mat4 = glm::perspective(f32::to_radians(45.0), 800.5 / 600.0, 0.1, 100.0);
     projection = glm::translate(&projection, &TVec3::new(0.0, 0.0, -3.0));
 
+    let movement_speed: f32 = 50.0;
 
     let mut event_pump = sdl.event_pump().unwrap();
     'main_loop: loop {
+        delta_timer.tick();
         for event in event_pump.poll_iter() {
             match event {
                 Event::Window {win_event, ..} => {
@@ -113,12 +118,12 @@ fn main() {
                         None => {}
                         Some(code) => {
                             match code {
-                                Keycode::A => camera_position = camera_position + LEFT,
-                                Keycode::D => camera_position = camera_position + RIGHT,
-                                Keycode::S => camera_position = camera_position + BACK,
-                                Keycode::W => camera_position = camera_position + FRONT,
-                                Keycode::Space => camera_position = camera_position + UP,
-                                Keycode::LShift => camera_position = camera_position + DOWN,
+                                Keycode::A => camera_position = camera_position + LEFT * movement_speed * delta_timer.delta_time(),
+                                Keycode::D => camera_position = camera_position + RIGHT * movement_speed * delta_timer.delta_time(),
+                                Keycode::S => camera_position = camera_position + BACK * movement_speed * delta_timer.delta_time(),
+                                Keycode::W => camera_position = camera_position + FRONT * movement_speed * delta_timer.delta_time(),
+                                Keycode::Space => camera_position = camera_position + UP * movement_speed * delta_timer.delta_time(),
+                                Keycode::LShift => camera_position = camera_position + DOWN * movement_speed * delta_timer.delta_time(),
                                 _ => {}
                             }
                         }
