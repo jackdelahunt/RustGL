@@ -5,6 +5,7 @@ extern crate  nalgebra_glm as glm;
 mod renderer;
 mod data;
 mod time;
+mod camera;
 
 use sdl2::event::{Event, WindowEvent};
 use std::ffi::CString;
@@ -17,13 +18,7 @@ use renderer::shader::Shader;
 use renderer::program::Program;
 use glm::{TVec3, Mat4};
 use sdl2::keyboard::Keycode;
-
-static UP: TVec3<f32> = TVec3::new(0.0, 1.0, 0.0);
-static DOWN: TVec3<f32> = TVec3::new(0.0, -1.0, 0.0);
-static FRONT: TVec3<f32> = TVec3::new(0.0, 0.0, -1.0);  // opengl left hand
-static BACK: TVec3<f32> = TVec3::new(0.0, 0.0, 1.0);    // opengl left hand
-static RIGHT: TVec3<f32> = TVec3::new(1.0, 0.0, 0.0);
-static LEFT: TVec3<f32> = TVec3::new(-1.0, 0.0, 0.0);
+use camera::Camera;
 
 fn main() {
     let sdl = sdl2::init().unwrap();
@@ -85,18 +80,11 @@ fn main() {
 
     shader_program.set_uniform_1i("texture_sample_1", 0);
 
-    let mut camera_position = TVec3::new(0.0, 0.0, 6.0);
-
     let mut model: Mat4 = glm::identity();
 
-    let mut view: Mat4 = glm::identity();
-    view = glm::look_at(
-        &camera_position,
-        &(&camera_position + &FRONT),
-        &UP,
-    );
+    let mut camera = Camera::new(&TVec3::new(0.0, 0.0, 2.0));
 
-    let mut projection: Mat4 = glm::perspective(f32::to_radians(45.0), 800.5 / 600.0, 0.1, 100.0);
+    let mut projection: Mat4 = glm::perspective(800.5 / 600.0, f32::to_radians(90.0), 0.1, 100.0);
     projection = glm::translate(&projection, &TVec3::new(0.0, 0.0, -3.0));
 
     let movement_speed: f32 = 50.0;
@@ -118,12 +106,12 @@ fn main() {
                         None => {}
                         Some(code) => {
                             match code {
-                                Keycode::A => camera_position = camera_position + LEFT * movement_speed * delta_timer.delta_time(),
-                                Keycode::D => camera_position = camera_position + RIGHT * movement_speed * delta_timer.delta_time(),
-                                Keycode::S => camera_position = camera_position + BACK * movement_speed * delta_timer.delta_time(),
-                                Keycode::W => camera_position = camera_position + FRONT * movement_speed * delta_timer.delta_time(),
-                                Keycode::Space => camera_position = camera_position + UP * movement_speed * delta_timer.delta_time(),
-                                Keycode::LShift => camera_position = camera_position + DOWN * movement_speed * delta_timer.delta_time(),
+                                Keycode::A => camera.translate(&(camera::LEFT * movement_speed * delta_timer.delta_time())),
+                                Keycode::W => camera.translate(&(camera::FRONT * movement_speed * delta_timer.delta_time())),
+                                Keycode::S => camera.translate(&(camera::BACK * movement_speed * delta_timer.delta_time())),
+                                Keycode::D => camera.translate(&(camera::RIGHT * movement_speed * delta_timer.delta_time())),
+                                Keycode::LShift => camera.translate(&(camera::DOWN * movement_speed * delta_timer.delta_time())),
+                                Keycode::Space => camera.translate(&(camera::UP * movement_speed * delta_timer.delta_time())),
                                 _ => {}
                             }
                         }
@@ -136,14 +124,8 @@ fn main() {
 
         model = glm::rotate(&model, f32::to_radians(1.5), &TVec3::new(1.0, 1.0, 1.0));
 
-        view = glm::look_at(
-            &camera_position,
-            &(&camera_position + &FRONT),
-            &UP,
-        );
-
         shader_program.set_uniform_matrix_4f("model", &model);
-        shader_program.set_uniform_matrix_4f("view", &view);
+        shader_program.set_uniform_matrix_4f("view", &camera.view_matrix());
         shader_program.set_uniform_matrix_4f("projection", &projection);
 
         renderer.clear();
