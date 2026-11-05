@@ -3005,6 +3005,12 @@ fn resolve_proc(n: &[u8]) -> *const c_void {
         b"eglGetCurrentSurface" => eglGetCurrentSurface as *const c_void,
         b"eglQuerySurface" => eglQuerySurface as *const c_void,
         b"eglSwapBuffers" => eglSwapBuffers as *const c_void,
+        b"eglGetPlatformDisplay" => eglGetPlatformDisplay as *const c_void,
+        b"eglGetPlatformDisplayEXT" => eglGetPlatformDisplayEXT as *const c_void,
+        b"eglCreatePlatformWindowSurface" => eglCreatePlatformWindowSurface as *const c_void,
+        b"eglCreatePlatformWindowSurfaceEXT" => eglCreatePlatformWindowSurfaceEXT as *const c_void,
+        b"eglSwapBuffersWithDamageKHR" => eglSwapBuffersWithDamageKHR as *const c_void,
+        b"eglSwapBuffersWithDamageEXT" => eglSwapBuffersWithDamageEXT as *const c_void,
         b"eglSwapInterval" => eglSwapInterval as *const c_void,
         b"eglQueryString" => eglQueryString as *const c_void,
         b"eglGetError" => eglGetError as *const c_void,
@@ -3343,6 +3349,154 @@ egl_export!(eglWaitGL() -> u32);
 egl_export!(eglWaitNative(engine: i32) -> u32);
 egl_export!(eglQueryContext(dpy: *mut c_void, ctx: *mut c_void, attr: i32, value: *mut i32) -> u32);
 egl_export!(eglQueryAPI() -> u32);
+
+// =============================================================================
+// EGL 1.5 / EGL_EXT_platform_base - the path SDL3 takes first
+//
+// Minecraft 26.3 replaced GLFW with SDL3 for window, input and platform integration
+// (26.3 Snapshot 4), and SDL3's EGL backend (src/video/SDL_egl.c) prefers
+// `eglGetPlatformDisplay` over `eglGetDisplay` and `eglCreatePlatformWindowSurface`
+// over `eglCreateWindowSurface` whenever the driver is EGL 1.5 or advertises
+// EGL_EXT_platform_base. It falls back to the EGL 1.4 spellings when they are missing,
+// so nothing here changes behaviour for the launchers that use EGL 1.4 - it only means
+// a 26.3-era launcher that points SDL3 at this library gets an answer instead of a null.
+//
+// Every one of these forwards to the system EGL and falls back to the older spelling
+// when the system EGL does not have it. EGLAttrib is `intptr_t` and EGL 1.4's EGLint is
+// `int`, so an attribute list has to be converted element by element; both are
+// terminated by EGL_NONE (0), which is what makes that safe.
+//
+// Not implemented: the EGL_EXT_device_enumeration family (`eglQueryDevicesEXT` and
+// friends), which SDL3 only uses for its offscreen/device-platform path, and the pixmap
+// variants - there are no pixmaps on Android, and this layer has no way to back one.
+// =============================================================================
+
+/// Copies an `EGLAttrib` list into `EGLint`s. `None` when `attribs` is null (SDL3 passes
+/// null). Walks to the `EGL_NONE` terminator, which both spellings require.
+unsafe fn egl_attribs_as_int(attribs: *const isize) -> Option<Vec<i32>> {
+    if attribs.is_null() {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut i = 0;
+    loop {
+        let v = *attribs.add(i);
+        out.push(v as i32);
+        if v == 0 {
+            return Some(out);
+        }
+        i += 1;
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglGetPlatformDisplay(
+    platform: u32,
+    native: *mut c_void,
+    attribs: *const isize,
+) -> *mut c_void {
+    type F = unsafe extern "C" fn(u32, *mut c_void, *const isize) -> *mut c_void;
+    if let Some(f) = egl_sym::<F>(b"eglGetPlatformDisplay\0") {
+        let dpy = f(platform, native, attribs);
+        if !dpy.is_null() {
+            log(&format!("[GLBridge] eglGetPlatformDisplay(0x{platform:04X}) -> system EGL"));
+            return dpy;
+        }
+    }
+    // EGL 1.4 driver: the platform is implied by the native display.
+    log(&format!("[GLBridge] eglGetPlatformDisplay(0x{platform:04X}) -> eglGetDisplay fallback"));
+    eglGetDisplay(native)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglGetPlatformDisplayEXT(
+    platform: u32,
+    native: *mut c_void,
+    attribs: *const i32,
+) -> *mut c_void {
+    type F = unsafe extern "C" fn(u32, *mut c_void, *const i32) -> *mut c_void;
+    if let Some(f) = egl_sym::<F>(b"eglGetPlatformDisplayEXT\0") {
+        let dpy = f(platform, native, attribs);
+        if !dpy.is_null() {
+            log(&format!("[GLBridge] eglGetPlatformDisplayEXT(0x{platform:04X}) -> system EGL"));
+            return dpy;
+        }
+    }
+    log(&format!(
+        "[GLBridge] eglGetPlatformDisplayEXT(0x{platform:04X}) -> eglGetDisplay fallback"
+    ));
+    eglGetDisplay(native)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglCreatePlatformWindowSurface(
+    dpy: *mut c_void,
+    config: *mut c_void,
+    native: *mut c_void,
+    attribs: *const isize,
+) -> *mut c_void {
+    type F = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *const isize) -> *mut c_void;
+    if let Some(f) = egl_sym::<F>(b"eglCreatePlatformWindowSurface\0") {
+        let s = f(dpy, config, native, attribs);
+        if !s.is_null() {
+            return s;
+        }
+    }
+    let ints = egl_attribs_as_int(attribs);
+    eglCreateWindowSurface(
+        dpy,
+        config,
+        native,
+        ints.as_ref().map(|v| v.as_ptr()).unwrap_or(std::ptr::null()),
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglCreatePlatformWindowSurfaceEXT(
+    dpy: *mut c_void,
+    config: *mut c_void,
+    native: *mut c_void,
+    attribs: *const i32,
+) -> *mut c_void {
+    type F = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *const i32) -> *mut c_void;
+    if let Some(f) = egl_sym::<F>(b"eglCreatePlatformWindowSurfaceEXT\0") {
+        let s = f(dpy, config, native, attribs);
+        if !s.is_null() {
+            return s;
+        }
+    }
+    eglCreateWindowSurface(dpy, config, native, attribs)
+}
+
+/// Damage-aware swap. SDL3 uses it when the driver has it; a plain swap is the correct
+/// answer when it does not, and ours still runs the overlay and the frame timing.
+#[no_mangle]
+pub unsafe extern "C" fn eglSwapBuffersWithDamageKHR(
+    dpy: *mut c_void,
+    surface: *mut c_void,
+    rects: *const i32,
+    n_rects: i32,
+) -> u32 {
+    type F = unsafe extern "C" fn(*mut c_void, *mut c_void, *const i32, i32) -> u32;
+    if let Some(f) = egl_sym::<F>(b"eglSwapBuffersWithDamageKHR\0") {
+        return f(dpy, surface, rects, n_rects);
+    }
+    eglSwapBuffers(dpy, surface)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglSwapBuffersWithDamageEXT(
+    dpy: *mut c_void,
+    surface: *mut c_void,
+    rects: *const i32,
+    n_rects: i32,
+) -> u32 {
+    type F = unsafe extern "C" fn(*mut c_void, *mut c_void, *const i32, i32) -> u32;
+    if let Some(f) = egl_sym::<F>(b"eglSwapBuffersWithDamageEXT\0") {
+        return f(dpy, surface, rects, n_rects);
+    }
+    eglSwapBuffersWithDamageKHR(dpy, surface, rects, n_rects)
+}
 
 // =============================================================================
 // Frame timing (`RENDERER_FRAME_STATS=1`)
@@ -3789,6 +3943,17 @@ mod tests {
         assert!(summarize(&ring).is_none());
         ring.push(16_000_000, 0);
         assert_eq!(summarize(&ring).map(|s| s.frames), Some(1));
+    }
+
+    #[test]
+    fn egl_attribs_convert_and_stop_at_the_terminator() {
+        // SDL3 passes null when it has no attributes to specify.
+        assert!(unsafe { egl_attribs_as_int(std::ptr::null()) }.is_none());
+        // EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RED_SIZE, 8, EGL_NONE
+        let list: [isize; 5] = [0x3033, 0x0004, 0x3024, 8, 0];
+        let out = unsafe { egl_attribs_as_int(list.as_ptr()) }.expect("converted");
+        assert_eq!(out, vec![0x3033i32, 4, 0x3024, 8, 0]);
+        assert_eq!(out.last(), Some(&0), "the EGL_NONE terminator is kept");
     }
 
     #[test]

@@ -106,6 +106,34 @@ Zalith truncates values at the second `=`. If you use the v1 entry on Minecraft
   run end to end on a device: what CI proves is that twenty shader dialects,
   six of them pack dialects, compile on a real GLES driver.
 
+## Minecraft 26.x
+
+Three different things happened to Minecraft: Java Edition in 2026, and they matter
+differently for this plugin.
+
+| Version | What changed | What that means here |
+|---|---|---|
+| **26.1, 26.2** | Still GLFW for the window and OpenGL for rendering | The same path as 1.21.x. Nothing 26-specific is known to be missing; if it fails, the log says which entry point was missing. |
+| **26.2+** | An **experimental Vulkan renderer**, chosen in *Options -> Video Settings -> Graphics API* | It needs Vulkan 1.2 with dynamic rendering and push descriptors, and falls back to OpenGL where that is missing [1](https://www.minecraft.net/en-us/article/minecraft-26-2-snapshot-1). A GE8300 has no usable Vulkan 1.2, so the game picks OpenGL by itself. To force it on a device whose Vulkan driver is present but bad, set `preferredGraphicsBackend:"opengl"` in the instance's `options.txt` - the same fix Mojang documented for 26.2 Pre-Release 1 [2](https://endgametools.com/en/minecraft/news/minecraft-vulkan). This plugin is the OpenGL path; it cannot serve the Vulkan one. |
+| **26.3+** | Window, input and platform integration moved from **GLFW to SDL3** [3](https://www.minecraft.net/en-us/article/minecraft-26-3-snapshot-4) | This plugin provides GL and EGL, not a windowing backend. The **launcher** has to supply SDL3 (as it supplies a GLFW stub today) and point it at this library: SDL3 reads `SDL_EGL_LIBRARY` and `SDL_OPENGL_LIBRARY` hints for that [4](https://wiki.libsdl.org/SDL3/SDL_HINT_EGL_LIBRARY). Prepared for it: our EGL now also answers the platform entry points SDL3 tries first - `eglGetPlatformDisplay`, `eglGetPlatformDisplayEXT` and `eglCreatePlatformWindowSurface(EXT)` - each forwarding to the system EGL and falling back to the EGL 1.4 spelling when the driver does not have it [5](https://github.com/spurious/SDL-mirror/blob/master/src/video/SDL_egl.c). |
+
+**WebGPU is not the answer to any of this**, and it is worth saying why rather than
+nodding along:
+
+* WebGPU has no fixed-function pipeline, no `glMapBuffer`, no VAOs, no `glGetError` - to
+  serve Minecraft's OpenGL calls through it, this project would have to become a complete
+  OpenGL implementation with a GLSL-to-WGSL compiler, which is ANGLE/zink-scale work.
+* On Android, WebGPU is not a system library. `wgpu` and Dawn both run on **Vulkan**
+  underneath [6](https://docs.rs/wgpu/latest/wgpu/struct.Backends.html), so on a
+  PowerVR GE8300 - exactly the device you are targeting - it would sit on the weakest
+  driver in the device instead of the well-trodden GLES one.
+* Every shader pack is GLSL. Translating arbitrary pack GLSL to WGSL is unsolved, so it
+  would throw away the shader-pack work.
+
+What would actually help 26.x is: (1) a log from a real 26.1/26.2 launch on your device,
+which tells us which OpenGL entry point or capability is missing, and (2) your launcher
+adding SDL3 support, which no renderer plugin can do from the outside.
+
 ## Signing and updates
 
 The APK is signed with the repository's release key when the
