@@ -532,13 +532,57 @@ const GL_MAJOR_VERSION: u32 = 0x821B;
 const GL_MINOR_VERSION: u32 = 0x821C;
 pub(crate) const GL_VERTEX_ARRAY_BINDING: u32 = 0x85B5;
 
+/// The widest claim the layer ever makes, and the one an OpenGL ES 3.2 driver underneath
+/// can actually back.
 static SPOOF_VERSION: &[u8] = b"4.5 (Core Profile) RustGL\0";
 static SPOOF_GLSL: &[u8] = b"4.50\0";
 
-/// Whether the layer reports its OpenGL 4.5 compatibility version.
-/// This is always enabled and does not imply full GL 4.5 feature coverage.
+/// Whether the layer reports a compatibility version at all. Always on - it is the number
+/// it reports that varies, see [`claimed_version`].
 fn spoof_gl() -> bool {
     true
+}
+
+/// The version this layer claims, as `(major, minor, GL_VERSION, GL_SHADING_LANGUAGE_VERSION)`.
+///
+/// It follows the driver underneath instead of being a constant:
+///
+/// | the driver really is | claim | why |
+/// |---|---|---|
+/// | OpenGL ES 3.2 | GL 4.5 / GLSL 4.50 | ES 3.2 backs everything this layer emulates |
+/// | OpenGL ES 3.1 | GL 4.3 / GLSL 4.30 | compute, image load/store and indirect draws are the 4.3 tier |
+/// | OpenGL ES 3.0 | GL 3.3 / GLSL 3.30 | no compute, no image load/store, no indirect draws |
+/// | anything older | GL 2.1 / GLSL 1.20 | only the fixed-function path can be honoured |
+///
+/// Claiming 4.5 unconditionally is what this did before, and it is an ES 3.0 or ES 3.1
+/// driver that pays for it: the game asks for compute shaders, image load/store or
+/// indirect draws the driver cannot do, and what comes back is a program that will not
+/// build, or an entry point that is not there. Older Mali parts are exactly those drivers,
+/// which is how the same build can work on an Adreno and fail on a Mali.
+fn claimed_version() -> (i32, i32, &'static [u8], &'static [u8]) {
+    let caps = gles3::caps();
+    if !caps.valid {
+        // Nothing has been measured yet - no context has been current. Guessing downwards
+        // would understate a driver that is about to report 3.2, so keep the widest claim.
+        return (4, 5, SPOOF_VERSION, SPOOF_GLSL);
+    }
+    let claim = match (caps.es_major, caps.es_minor) {
+        (major, minor) if (major, minor) >= (3, 2) => {
+            (4, 5, b"4.5 (Core Profile) RustGL\0".as_slice(), b"4.50\0".as_slice())
+        }
+        (3, 1) => (4, 3, b"4.3 (Core Profile) RustGL\0".as_slice(), b"4.30\0".as_slice()),
+        (3, _) => (3, 3, b"3.3 (Core Profile) RustGL\0".as_slice(), b"3.30\0".as_slice()),
+        _ => (2, 1, b"2.1 RustGL\0".as_slice(), b"1.20\0".as_slice()),
+    };
+    static CLAIMED_ONCE: OnceLock<()> = OnceLock::new();
+    if CLAIMED_ONCE.set(()).is_ok() {
+        log(&format!(
+            "[GLCompat] driver is OpenGL ES {}.{} ({}); claiming GL {}.{} / GLSL {}",
+            caps.es_major, caps.es_minor, caps.device_description, claim.0, claim.1,
+            String::from_utf8_lossy(claim.3.strip_suffix(&[0u8]).unwrap_or(claim.3))
+        ));
+    }
+    claim
 }
 
 /// Resolves a driver function pointer of type `T` (must be a fn pointer type).
@@ -844,7 +888,16 @@ fn sys_egl_get_proc(name: &str) -> Option<*const c_void> {
 /// renders, instead of pointing at the layer.
 fn renderer_identity() -> (&'static CStr, &'static CStr) {
     static IDENTITY: OnceLock<(&'static CStr, &'static CStr)> = OnceLock::new();
-    *IDENTITY.get_or_init(|| (c"WhalterMC", c"OpenGL ES 3.2 RustGL"))
+    *IDENTITY.get_or_init(|| {
+        // Name the ES version the driver underneath actually reports. Hardcoding 3.2 hid
+        // the difference between a driver that can back a GL 4.5 claim and one that
+        // cannot, which is the first thing a bug report has to show.
+        let caps = gles3::caps();
+        let (major, minor) = if caps.valid { (caps.es_major, caps.es_minor) } else { (3, 2) };
+        let text = format!("OpenGL ES {major}.{minor} RustGL\0");
+        let leaked: &'static str = Box::leak(text.into_boxed_str());
+        (c"WhalterMC", CStr::from_bytes_with_nul(leaked.as_bytes()).unwrap())
+    })
 }
 
 static SPOOF_EXTENSIONS: &[u8] = b"\0"; // empty; use glGetStringi when needed
@@ -858,8 +911,8 @@ pub extern "C" fn glGetString(name: u32) -> *const u8 {
 
     if spoof_gl() {
         match name {
-            GL_VERSION => return SPOOF_VERSION.as_ptr(),
-            GL_SHADING_LANGUAGE_VERSION => return SPOOF_GLSL.as_ptr(),
+            GL_VERSION => return claimed_version().2.as_ptr(),
+            GL_SHADING_LANGUAGE_VERSION => return claimed_version().3.as_ptr(),
             GL_VENDOR => return renderer_identity().0.as_ptr() as *const u8,
             GL_RENDERER => return renderer_identity().1.as_ptr() as *const u8,
             GL_EXTENSIONS => return merged_extension_string().as_ptr(),
@@ -890,8 +943,8 @@ pub extern "C" fn glGetString(name: u32) -> *const u8 {
     match name {
         GL_VENDOR => renderer_identity().0.as_ptr() as *const u8,
         GL_RENDERER => renderer_identity().1.as_ptr() as *const u8,
-        GL_VERSION => SPOOF_VERSION.as_ptr(),
-        GL_SHADING_LANGUAGE_VERSION => SPOOF_GLSL.as_ptr(),
+        GL_VERSION => claimed_version().2.as_ptr(),
+        GL_SHADING_LANGUAGE_VERSION => claimed_version().3.as_ptr(),
         GL_EXTENSIONS => SPOOF_EXTENSIONS.as_ptr(),
         _ => {
             errors().set(GL_INVALID_VALUE);
@@ -920,8 +973,8 @@ pub unsafe extern "C" fn glGetIntegerv(pname: u32, data: *mut i32) {
     }
     if spoof_gl() {
         match pname {
-            GL_MAJOR_VERSION => { *data = 4; return; }
-            GL_MINOR_VERSION => { *data = 5; return; }
+            GL_MAJOR_VERSION => { *data = claimed_version().0; return; }
+            GL_MINOR_VERSION => { *data = claimed_version().1; return; }
             0x9126 => { *data = 0x0001; return; } // GL_CONTEXT_PROFILE_MASK = CORE_PROFILE_BIT
             GL_NUM_EXTENSIONS => {
                 *data = merged_extensions().len() as i32;
@@ -3923,26 +3976,44 @@ mod tests {
     fn minecraft_gpu_identity_uses_rustgl_brand() {
         let (vendor, renderer) = renderer_identity();
         assert_eq!(vendor.to_bytes(), b"WhalterMC");
-        assert_eq!(renderer.to_bytes(), b"OpenGL ES 3.2 RustGL");
+        // The ES version in the renderer string is the one the driver reported, so it is
+        // checked for shape rather than pinned to 3.2.
+        let renderer = renderer.to_bytes();
+        assert!(renderer.starts_with(b"OpenGL ES "), "renderer was {renderer:?}");
+        assert!(renderer.ends_with(b" RustGL"), "renderer was {renderer:?}");
     }
 
+    /// The claim has to follow the driver: a constant 4.5 is what made an ES 3.0 driver
+    /// fail on features it cannot back.
     #[test]
-    fn spoofed_gl_version_matches_the_supported_target() {
-        assert_eq!(
-            CStr::from_bytes_until_nul(SPOOF_VERSION).unwrap().to_bytes(),
-            b"4.5 (Core Profile) RustGL"
-        );
-        assert_eq!(
-            CStr::from_bytes_until_nul(SPOOF_GLSL).unwrap().to_bytes(),
-            b"4.50"
-        );
-        let mut major = 0;
-        let mut minor = 0;
+    fn claimed_gl_version_follows_the_driver_underneath() {
+        let caps = crate::gles3::caps();
+        let expected: (i32, i32, &str, &str) = if !caps.valid {
+            (4, 5, "4.5 (Core Profile) RustGL", "4.50")
+        } else {
+            match (caps.es_major, caps.es_minor) {
+                (major, minor) if (major, minor) >= (3, 2) => {
+                    (4, 5, "4.5 (Core Profile) RustGL", "4.50")
+                }
+                (3, 1) => (4, 3, "4.3 (Core Profile) RustGL", "4.30"),
+                (3, _) => (3, 3, "3.3 (Core Profile) RustGL", "3.30"),
+                _ => (2, 1, "2.1 RustGL", "1.20"),
+            }
+        };
+        let (major, minor, version, glsl) = claimed_version();
+        assert_eq!((major, minor), (expected.0, expected.1));
+        assert_eq!(CStr::from_bytes_until_nul(version).unwrap().to_bytes(),
+                   expected.2.as_bytes());
+        assert_eq!(CStr::from_bytes_until_nul(glsl).unwrap().to_bytes(),
+                   expected.3.as_bytes());
+        // What the game reads back has to agree with the string it is shown.
+        let mut queried_major = 0;
+        let mut queried_minor = 0;
         unsafe {
-            glGetIntegerv(GL_MAJOR_VERSION, &mut major);
-            glGetIntegerv(GL_MINOR_VERSION, &mut minor);
+            glGetIntegerv(GL_MAJOR_VERSION, &mut queried_major);
+            glGetIntegerv(GL_MINOR_VERSION, &mut queried_minor);
         }
-        assert_eq!((major, minor), (4, 5));
+        assert_eq!((queried_major, queried_minor), (major, minor));
     }
 
     /// One representative entry point per advertised extension. Claiming an extension

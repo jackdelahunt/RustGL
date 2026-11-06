@@ -52,6 +52,45 @@ Requirements: **Android 8.0 (API 26) or newer** and real **OpenGL ES 3**
 support. Android picks the ABI of the *launcher process*, not of the CPU: a
 32-bit launcher on a 64-bit phone uses the armeabi-v7a build.
 
+## If it does not work on a Mali GPU
+
+**The version this layer claims used to be a constant, and that is the first thing to
+check.** Until 0.3.0-gurkha.10 the renderer told the game, unconditionally, that it was
+OpenGL 4.5 with GLSL 4.50 - whatever the driver underneath really was. On an OpenGL ES 3.2
+part that is roughly true. On an ES 3.0 or ES 3.1 part - which is what most older Mali
+GPUs are, where an Adreno of the same vintage is 3.2 - it is not, and the game then asks
+for compute shaders, image load/store and indirect draws the driver cannot do. What comes
+back is a program that will not build or an entry point that is not there, and from the
+launcher that looks like "the renderer does not work on Mali".
+
+From 0.3.0-gurkha.10 the claim follows the driver:
+
+| the driver really is | what the game is told |
+|---|---|
+| OpenGL ES 3.2 | GL 4.5 / GLSL 4.50 |
+| OpenGL ES 3.1 | GL 4.3 / GLSL 4.30 |
+| OpenGL ES 3.0 | GL 3.3 / GLSL 3.30 |
+| older | GL 2.1 / GLSL 1.20 |
+
+The advertised extension list was already gated the same way - `GL_ARB_compute_shader`,
+`GL_ARB_shader_image_load_store` and `GL_ARB_multi_draw_indirect` only appear when the
+driver has the ES feature behind them - so the claim and the extension list now agree.
+
+**What to send if it still fails.** The renderer logs this once, at startup:
+
+```
+[GLCompat] driver is OpenGL ES 3.0 (OpenGL ES 3.0 build 1.9@1234567); claiming GL 3.3 / GLSL 3.30
+```
+
+That single line says which tier your GPU landed in. Follow it with any
+`[GLCompat] compile failed shader=…` lines, which carry the driver's own GLSL error and
+the translated source around the line it names - that is the difference between "Mali
+cannot do this" and "the translation emitted something wrong".
+
+Honest limit: this change was reasoned from the code and from what each ES version can
+back. No Mali device was available here, so while it removes a claim that was false on
+those parts, it has not been run on one.
+
 ## If it crashes on a 64-bit phone but works on a 32-bit one
 
 **Check the page size first.** Android 15 introduced 16 KB memory pages, and a shared
