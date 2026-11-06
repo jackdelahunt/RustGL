@@ -1,0 +1,57 @@
+RustGL universal renderer plugin for Minecraft: Java Edition launchers on Android
+================================================================================
+
+This package (np.com.gurkha.rustgl.plugin) is a renderer plugin: it contains the
+RustGL renderer library `librust_gl.so` for arm64-v8a, armeabi-v7a, x86 and
+x86_64, plugin meta-data for the FCL / Zalith RendererPlugin v1 and v2
+contracts, and a small information Activity. It contains no game, no Minecraft
+assets and no third-party tracking code.
+
+Renderer library: RustGL
+------------------------
+* Library: librust_gl.so, built from the Rust workspace in `rustgl/` of this
+  repository.
+* Synced unmodified from Gurkha Launcher
+  <https://github.com/kushaladhikari982648-lgtm/Gurkha-launcher>, directory
+  `rustgl/`, branch `arena/a8e9723f-gurkha-launcher`, commit 1726782a
+  (tree bbeac11aa95dff9509a8d91c6cb6477168cff206).
+  `python3 tools/check_sync.py` verifies the copy byte for byte.
+* Upstream of that code: <https://github.com/whaltermc/rust-renderer>,
+  revision eb22559.
+* Upstream publishes no licence file. Until its author adds one, this renderer
+  code is redistributed as "used with the author's permission"; it is NOT
+  covered by the MIT licence below and no licence is claimed for it. Please
+  keep this notice with any copy and replace the library freely - the plugin
+  format exists precisely so that a renderer can be swapped out.
+
+Packaging tooling
+-----------------
+`android-plugin/` (manifest, v2 renderer config, Activity),
+`tools/` (APK packager, APK verifier, sync checker) and `tests/` are released
+under the MIT licence:
+
+  Copyright (c) 2026 RustGL-for-Gurkha-launcher contributors
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+  FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+  DEALINGS IN THE SOFTWARE.
+
+Trademarks
+----------
+"Minecraft" is a trademark of Mojang Studios. This project is not affiliated
+with Mojang Studios, Microsoft, or with any of the launchers named in the
+documentation.

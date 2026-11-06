@@ -1,0 +1,86 @@
+{
+  "displayName": "RustGL (Gurkha build)",
+  "rendererId": "opengles3",
+  "rendererGLPath": "**|librustgl.so",
+  "rendererEGLPath": "**|librustgl.so",
+  "dlopenLibPaths": [],
+  "env": [
+    {
+      "type": "NormalEnv",
+      "key": "LIBGL_ES",
+      "value": "3"
+    },
+    {
+      "type": "NormalEnv",
+      "key": "RENDERER_BACKEND",
+      "value": "gles"
+    },
+    {
+      "type": "NormalEnv",
+      "key": "JAVA_TOOL_OPTIONS",
+      "value": "-Dorg.lwjgl.util.NoChecks=true"
+    },
+    {
+      "type": "SelectableEnv",
+      "key": "RENDERER_SPOOF_GL",
+      "title": {
+        "key": "rustgl_spoof_title"
+      },
+      "check": null,
+      "items": {
+        "defaultValue": "1",
+        "values": [
+          "1",
+          "0"
+        ]
+      }
+    },
+    {
+      "type": "SelectableEnv",
+      "key": "RENDERER_DEBUG",
+      "title": {
+        "key": "rustgl_debug_title"
+      },
+      "check": null,
+      "items": {
+        "defaultValue": "0",
+        "values": [
+          "0",
+          "1"
+        ]
+      }
+    },
+    {
+      "type": "SelectableEnv",
+      "key": "RENDERER_TRACE_GL",
+      "title": {
+        "key": "rustgl_trace_title"
+      },
+      "check": null,
+      "items": {
+        "defaultValue": "0",
+        "values": [
+          "0",
+          "1"
+        ]
+      }
+    },
+    {
+      "type": "SelectableEnv",
+      "key": "RENDERER_FRAME_STATS",
+      "title": {
+        "key": "rustgl_framestats_title"
+      },
+      "check": null,
+      "items": {
+        "defaultValue": "0",
+        "values": [
+          "0",
+          "1"
+        ]
+      }
+    }
+  ],
+  "minMCVer": null,
+  "maxMCVer": null
+}

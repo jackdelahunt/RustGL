@@ -1,3 +1,11 @@
 /target
-Cargo.lock
+/Cargo.lock
 /.idea
+
+# The renderer workspace is a separate Cargo workspace: its lock file is part of
+# the synced source (tools/check_sync.py hashes the whole tree), its build
+# output is not.
+/rustgl/target
+/artifacts
+__pycache__/
+.gradle

@@ -1,0 +1,243 @@
+name: RustGL universal plugin APK
+
+on:
+  push:
+    branches: [arena/23f25781-rustgl-for-gurkha-launcher]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+# The release job is the only one that writes to the repository.
+permissions:
+  contents: read
+
+jobs:
+  RustGLChecks:
+    name: Renderer tests (host, Mesa GLES)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check the renderer source matches Gurkha Launcher
+        run: python3 tools/check_sync.py
+      - name: Plugin contract tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Run the renderer tests on software GLES
+        id: render_tests
+        env:
+          EGL_PLATFORM: surfaceless
+          LIBGL_ALWAYS_SOFTWARE: '1'
+          CARGO_TERM_COLOR: never
+        run: |
+          set -o pipefail
+          {
+            sudo apt-get update -q
+            sudo apt-get install -y --no-install-recommends \
+              libegl1 libgles2 libgles1 libegl-dev libgles-dev libgl1-mesa-dri
+            cd rustgl
+            cargo test -p renderer-core -p gl-compat -p shader-translate -- --test-threads=1
+            cargo build -p gl-compat
+            python3 tests/render_smoke.py
+            MESA_EXTENSION_OVERRIDE=-GL_EXT_buffer_storage python3 tests/render_smoke.py
+            MESA_GLES_VERSION_OVERRIDE=3.1 python3 tests/render_smoke.py
+          } 2>&1 | tee "$RUNNER_TEMP/rustgl-render-tests.log"
+      - name: Report the rendering test failure
+        if: failure()
+        run: |
+          python3 - "$RUNNER_TEMP/rustgl-render-tests.log" <<'PY'
+          import pathlib, sys
+          path = pathlib.Path(sys.argv[1])
+          text = path.read_text(errors="replace") if path.exists() else "Test log missing"
+          text = text[-3000:].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          print("::error title=RustGL rendering regression::" + text)
+          PY
+
+  RendererLibraries:
+    name: Build the renderer (4 ABIs)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+      - name: Build the renderer for every ABI
+        id: native
+        env:
+          CARGO_TERM_COLOR: never
+          RUSTFLAGS: "-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384"
+          # Android 15+ devices run with 16 KB pages, and a library whose ELF segments
+          # are only 4 KB aligned fails to load on them at all - dlopen reports "has bad
+          # ELF alignment", which from the launcher looks like "the renderer crashes".
+          # zipalign -P 16 aligns the entry inside the APK; this aligns the ELF inside
+          # the library, which is the half that has to come from the linker.
+        run: |
+          set -o pipefail
+          {
+            cargo install cargo-ndk --locked
+            "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" 'ndk;25.2.9519653' > /dev/null
+            export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/25.2.9519653"
+            echo "ANDROID_NDK_ROOT=$ANDROID_NDK_HOME" >> "$GITHUB_ENV"
+            cd rustgl
+            cargo ndk -t arm64-v8a -t armeabi-v7a -t x86 -t x86_64 build --release -p gl-compat
+            cd ..
+            python3 tools/collect_native.py --target rustgl/target --output artifacts/rustgl
+          } 2>&1 | tee "$RUNNER_TEMP/rustgl-native.log"
+      - name: Report the native build failure
+        if: failure() && steps.native.outcome != 'success'
+        run: |
+          python3 - "$RUNNER_TEMP/rustgl-native.log" <<'PY'
+          import pathlib, sys
+          path = pathlib.Path(sys.argv[1])
+          lines = path.read_text(errors="replace").splitlines() if path.exists() else []
+          keep = [line for line in lines if line.startswith(("error", "warning: unused", "  -->", "     "))]
+          text = "\n".join(keep[-60:]) or "\n".join(lines[-40:]) or "No Rust output captured."
+          text = text.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+          print("::error title=RustGL native build failed::" + text)
+          PY
+      - uses: actions/upload-artifact@v7
+        with:
+          name: rustgl-native-libraries
+          path: artifacts/rustgl/
+          if-no-files-found: error
+
+  UniversalApk:
+    name: Package the universal plugin APK
+    runs-on: ubuntu-22.04
+    needs: [RustGLChecks, RendererLibraries]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: rustgl-native-libraries
+          path: artifacts/rustgl
+      - name: Install the Android build tools
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            'platform-tools' 'build-tools;35.0.0' 'platforms;android-35' > /dev/null
+      - name: Build and verify the APK
+        env:
+          APK_KEYSTORE_BASE64: ${{ secrets.APK_KEYSTORE_BASE64 }}
+          APK_KEYSTORE_PASSWORD: ${{ secrets.APK_KEYSTORE_PASSWORD }}
+          APK_KEY_ALIAS: ${{ secrets.APK_KEY_ALIAS }}
+        run: |
+          set -o pipefail
+          {
+            python3 - <<'PY' > "$RUNNER_TEMP/native-metadata.json"
+          import json, os
+          print(json.dumps({
+              "workflow": os.environ.get("GITHUB_WORKFLOW"),
+              "run": os.environ.get("GITHUB_RUN_ID"),
+              "runUrl": f"{os.environ.get('GITHUB_SERVER_URL')}/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}",
+              "commit": os.environ.get("GITHUB_SHA"),
+              "ref": os.environ.get("GITHUB_REF"),
+              "ndk": "25.2.9519653",
+              "rust": os.popen("rustc --version").read().strip(),
+          }, indent=2))
+          PY
+            python3 tools/package_apk.py --sdk "$ANDROID_HOME" \
+              --metadata "$RUNNER_TEMP/native-metadata.json" --output artifacts/release
+            python3 tools/verify_apk.py artifacts/release/*.apk --sdk "$ANDROID_HOME"
+          } 2>&1 | tee "$RUNNER_TEMP/package.log"
+      - name: Report the packaging failure
+        if: failure()
+        run: |
+          python3 - "$RUNNER_TEMP/package.log" <<'PY'
+          import pathlib, sys
+          path = pathlib.Path(sys.argv[1])
+          text = path.read_text(errors="replace") if path.exists() else "Packaging log missing"
+          # The tail of the log is mostly aapt2 noise; the reason for the failure is
+          # whichever line says what went wrong, so print those before the tail.
+          reasons = [line for line in text.splitlines()
+                     if line.startswith(("Traceback", "SystemExit", "subprocess.CalledProcessError"))
+                     or ": error:" in line or line.startswith("  File ")]
+          # Reasons first, then a short tail: the annotation is capped at 3000
+          # characters, so keeping the end of the message is what cut the reason off.
+          shown = "\n".join(dict.fromkeys(reasons + text.splitlines()[-8:]))
+          esc = shown.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          print("::error title=RustGL plugin packaging failed::" + esc[:3000])
+          PY
+      - name: Upload the packaging log when it fails
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rustgl-packaging-log
+          path: ${{ runner.temp }}/package.log
+          if-no-files-found: warn
+      - name: Show the packaged artifacts
+        run: |
+          ls -l artifacts/release
+          cat artifacts/release/SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: rustgl-universal-plugin
+          path: artifacts/release/
+          if-no-files-found: error
+
+  Release:
+    name: Publish the release
+    runs-on: ubuntu-22.04
+    needs: [UniversalApk]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: rustgl-universal-plugin
+          path: artifacts/release
+      - name: Create the release
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          NOTES="$RUNNER_TEMP/release-notes.md"
+          if [ -n "${{ secrets.APK_KEYSTORE_BASE64 }}" ]; then
+            SIGNING="Signed with the repository release key, so later releases update in place."
+          else
+            SIGNING="Signed with a key generated for this build: no APK_KEYSTORE_BASE64 secret is
+          configured for this repository, so a later release has to be installed after
+          uninstalling this one. Uninstalling the plugin only removes the renderer entry;
+          the launcher and Minecraft data are untouched."
+          fi
+          {
+            echo "Universal RustGL renderer plugin APK for Android launchers."
+            echo
+            echo "One APK (arm64-v8a, armeabi-v7a, x86, x86_64) with both the"
+            echo "RendererPlugin v2 contract (Zalith Launcher 2, FCL) and the v1"
+            echo "contract (Zalith/Gurkha, FCL legacy path, Pojav-family forks)."
+            echo
+            echo "Install, select and limitation notes are in README.txt inside"
+            echo "every artifact and at docs/UNIVERSAL_APK.md in the repository."
+            echo
+            echo "Experimental: not validated on every launcher, GPU or Minecraft"
+            echo "version. Test a clean instance and keep your previous renderer."
+            echo
+            # The tag's annotation is the changelog for that build: `git tag -a vX -m "..."`.
+            ANNOTATION=""
+            if git rev-parse -q --verify "refs/tags/$TAG" > /dev/null; then
+              ANNOTATION=$(git tag -l --format='%(contents:body)' "$TAG")
+            fi
+            if [ -n "$ANNOTATION" ]; then
+              echo "## What changed"
+              echo
+              echo "$ANNOTATION"
+              echo
+            fi
+            echo "## Signing"
+            echo
+            echo "$SIGNING"
+            echo
+            echo "## Checksums"
+            echo
+            echo '```'
+            cat artifacts/release/SHA256SUMS
+            echo '```'
+          } > "$NOTES"
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" artifacts/release/* --clobber
+          else
+            gh release create "$TAG" --title "RustGL universal plugin $TAG" \
+              --target "$GITHUB_SHA" --notes-file "$NOTES" artifacts/release/*
+          fi

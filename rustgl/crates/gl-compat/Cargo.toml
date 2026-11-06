@@ -1,0 +1,19 @@
+[package]
+name = "gl-compat"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "rust_gl"
+crate-type = ["cdylib"]
+
+[dependencies]
+backend = { path = "../backend" }
+renderer-core = { path = "../renderer-core" }
+shader-translate = { path = "../shader-translate" }
+format-translate = { path = "../format-translate" }
+libloading = "0.8"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.14"
+log = "0.4"
