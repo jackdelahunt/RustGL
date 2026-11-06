@@ -69,7 +69,6 @@ jobs:
           # ELF alignment", which from the launcher looks like "the renderer crashes".
           # zipalign -P 16 aligns the entry inside the APK; this aligns the ELF inside
           # the library, which is the half that has to come from the linker.
-          RUSTFLAGS: "-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384"
         run: |
           set -o pipefail
           {

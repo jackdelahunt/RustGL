@@ -87,7 +87,7 @@ def extract_json(text: str, marker: str = '{"displayName"') -> dict:
 
 
 PT_LOAD = 1
-PAGE_16K = 16384
+PAGE_16K = 65536  # TEMPORARY: force a failure to print the table
 
 
 def load_segment_alignments(blob: bytes):
