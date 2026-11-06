@@ -65,7 +65,29 @@ Two separate alignments are needed, and this repository now does both and checks
 | What | Where it comes from | Status here |
 |---|---|---|
 | the entry inside the APK | `zipalign -P 16 4` | already done |
-| the ELF segments inside the `.so` | the linker: `-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384` | added in 0.3.0-gurkha.9, **checked on every build** by `tools/verify_apk.py`, which parses the program headers of every shipped library and fails the build if a `PT_LOAD` segment is aligned to less than 16 KB or starts at an offset that is not a multiple of it |
+| the ELF segments inside the `.so` | the linker: `-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384` | added in 0.3.0-gurkha.9, **checked on every build** by `tools/verify_apk.py`, which parses the program headers of every shipped library |
+
+`tools/verify_apk.py` requires two things of every `PT_LOAD` segment:
+
+* `p_align` must be at least 16 KB (0x4000). A segment aligned to 4 KB cannot satisfy a
+  16 KB mapping, whatever its offset.
+* `p_offset` and `p_vaddr` must be **congruent modulo 16 KB** - the linker maps the page
+  that contains the segment's file offset onto the page that contains its address, so any
+  difference that is not a whole number of 16 KB pages lands the bytes in the wrong place.
+
+The file offset does *not* have to be a multiple of 16 KB. It usually is not: the linker
+packs the segments one after another, and what it guarantees is the congruence above. The
+segments in the shipped arm64 build, for example, are
+
+```
+[align 0x4000 offset 0x0      vaddr 0x0]
+[align 0x4000 offset 0x6304c  vaddr 0x6704c]
+[align 0x4000 offset 0x181530 vaddr 0x189530]
+[align 0x4000 offset 0x188950 vaddr 0x194950]
+```
+
+every one 16 KB aligned, every pair 16 KB congruent, and none of the offsets a round
+multiple of 16 KB - which is correct, and is what the check now enforces.
 
 If the crash survives 0.3.0-gurkha.9, it is not this. What is needed then is the log:
 `adb logcat` filtered on the launcher, or the launcher's own log export. The useful

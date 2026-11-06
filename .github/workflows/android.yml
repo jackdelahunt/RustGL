@@ -64,6 +64,7 @@ jobs:
         id: native
         env:
           CARGO_TERM_COLOR: never
+          RUSTFLAGS: "-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384"
           # Android 15+ devices run with 16 KB pages, and a library whose ELF segments
           # are only 4 KB aligned fails to load on them at all - dlopen reports "has bad
           # ELF alignment", which from the launcher looks like "the renderer crashes".

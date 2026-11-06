@@ -135,14 +135,26 @@ class ManifestTests(unittest.TestCase):
             return bytes(blob)
 
         for elf_class in (2, 1):
-            good = elf(elf_class, 16384, 16384)
+            good = elf(elf_class, 16384, 0, vaddr=0x10000)
             self.assertEqual(verify_apk.load_segment_alignments(good),
-                             [(16384, 16384, 0x10000)])
+                             [(16384, 0, 0x10000)])
             verify_apk.check_page_alignment("good.so", good)
+
+            # The real build: 16 KB alignment, and an offset that is congruent with the
+            # virtual address but is not a multiple of 16 KB. That is what lld emits - and
+            # what Google's own documentation shows as a valid 16 KB library - so it has
+            # to pass even though the old rule ("offset % 16 KB") would have rejected it.
+            real = elf(elf_class, 16384, 0x42A90, vaddr=0x52A90)
+            verify_apk.check_page_alignment("real.so", real)
+
+            # The genuine 16 KB failure: segments aligned to 4 KB only.
             with self.assertRaises(SystemExit):
                 verify_apk.check_page_alignment("small.so", elf(elf_class, 4096, 4096))
+
+            # Aligned, but offset and address are not congruent modulo 16 KB, so the
+            # segment cannot be mmap'ed onto the address it asks for.
             with self.assertRaises(SystemExit):
-                verify_apk.check_page_alignment("shifted.so", elf(elf_class, 16384, 4096))
+                verify_apk.check_page_alignment("skew.so", elf(elf_class, 16384, 0x4000, vaddr=0x1000))
         self.assertEqual(verify_apk.load_segment_alignments(b"not an elf"), [])
 
     def test_every_abi_ships_the_library_under_both_names(self):

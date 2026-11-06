@@ -87,15 +87,18 @@ def extract_json(text: str, marker: str = '{"displayName"') -> dict:
 
 
 PT_LOAD = 1
-PAGE_16K = 65536  # TEMPORARY: force a failure to print the table
+PAGE_16K = 16384
 
 
 def load_segment_alignments(blob: bytes):
-    """The `p_align` of every PT_LOAD segment, and each one's file offset.
+    """The `p_align`, `p_offset` and `p_vaddr` of every PT_LOAD segment.
 
-    Android 15+ devices use 16 KB pages. The installer refuses a library whose loadable
-    segments are aligned to anything smaller, and the failure surfaces as a crash the
-    first time the game touches the renderer - not as an error anyone reads.
+    Android 15+ devices use 16 KB pages. The dynamic linker mmaps each PT_LOAD
+    segment, so every one has to be aligned to at least 16 KB, and its file offset
+    and virtual address have to be congruent modulo that alignment. The offset
+    itself does *not* have to be a multiple of 16 KB - the linker maps the
+    containing page and skips the slack. A bad segment surfaces as a crash the first
+    time the game touches the renderer, not as an error anyone reads.
     """
     if blob[:4] != b"\x7fELF":
         return []
@@ -136,16 +139,18 @@ def check_page_alignment(entry: str, blob: bytes) -> None:
     table = ", ".join(
         f"[align 0x{align:x} offset 0x{offset:x} vaddr 0x{vaddr:x}]" for align, offset, vaddr in segments
     )
-    for align, offset, _vaddr in segments:
+    for align, offset, vaddr in segments:
         if align < PAGE_16K:
             raise SystemExit(
                 f"{entry}: a PT_LOAD segment is aligned to 0x{align:x}, not 16 KB - this "
                 "library cannot load on an Android 15+ 16 KB-page device. Segments: " + table
             )
-        if offset % PAGE_16K != 0:
+        if (vaddr - offset) % PAGE_16K != 0:
             raise SystemExit(
-                f"{entry}: a PT_LOAD segment starts at file offset 0x{offset:x}, which is "
-                "not a multiple of 16 KB - the installer will reject it. Segments: " + table
+                f"{entry}: a PT_LOAD segment sits at file offset 0x{offset:x} but asks to "
+                f"be mapped at 0x{vaddr:x}; the two differ by 0x{(vaddr - offset) % PAGE_16K:x} "
+                f"modulo 16 KB, so the linker cannot map the page it reads onto the "
+                "address the segment asks for. Segments: " + table
             )
 
 
