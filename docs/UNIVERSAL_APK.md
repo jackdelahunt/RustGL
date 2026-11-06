@@ -52,6 +52,30 @@ Requirements: **Android 8.0 (API 26) or newer** and real **OpenGL ES 3**
 support. Android picks the ABI of the *launcher process*, not of the CPU: a
 32-bit launcher on a 64-bit phone uses the armeabi-v7a build.
 
+## If it crashes on a 64-bit phone but works on a 32-bit one
+
+**Check the page size first.** Android 15 introduced 16 KB memory pages, and a shared
+library whose loadable segments are only aligned to 4 KB simply does not load on those
+devices: `dlopen` fails with "has bad ELF alignment", and from the launcher that looks
+like the renderer crashing. 64-bit phones are the newer ones, so this failure maps almost
+exactly onto "works on my old 32-bit device, crashes on a friend's newer one".
+
+Two separate alignments are needed, and this repository now does both and checks both:
+
+| What | Where it comes from | Status here |
+|---|---|---|
+| the entry inside the APK | `zipalign -P 16 4` | already done |
+| the ELF segments inside the `.so` | the linker: `-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384` | added in 0.3.0-gurkha.9, **checked on every build** by `tools/verify_apk.py`, which parses the program headers of every shipped library and fails the build if a `PT_LOAD` segment is aligned to less than 16 KB or starts at an offset that is not a multiple of it |
+
+If the crash survives 0.3.0-gurkha.9, it is not this. What is needed then is the log:
+`adb logcat` filtered on the launcher, or the launcher's own log export. The useful
+lines name either `librust_gl.so` / `librustgl.so` (a loading problem) or a GL entry
+point (`[GLBridge] Missing entry point: …`, a coverage problem).
+
+Honest limit: the arm64 and x86_64 builds are compiled in CI and pass the same unit tests
+as the host build, but the on-device smoke test (`rustgl/tests/render_smoke.py`) runs
+against Mesa on the CI machine only. Nothing here has been run on a 64-bit phone.
+
 ## Library names
 
 Every ABI in the APK carries the renderer **twice**, as identical copies:

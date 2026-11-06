@@ -86,6 +86,66 @@ def extract_json(text: str, marker: str = '{"displayName"') -> dict:
     raise LookupError("unterminated renderer JSON")
 
 
+PT_LOAD = 1
+PAGE_16K = 16384
+
+
+def load_segment_alignments(blob: bytes):
+    """The `p_align` of every PT_LOAD segment, and each one's file offset.
+
+    Android 15+ devices use 16 KB pages. The installer refuses a library whose loadable
+    segments are aligned to anything smaller, and the failure surfaces as a crash the
+    first time the game touches the renderer - not as an error anyone reads.
+    """
+    if blob[:4] != b"\x7fELF":
+        return []
+    elf_class = blob[4]
+    if elf_class == 2:  # 64-bit
+        e_phoff = int.from_bytes(blob[0x20:0x28], "little")
+        e_phentsize = int.from_bytes(blob[0x36:0x38], "little")
+        e_phnum = int.from_bytes(blob[0x38:0x3A], "little")
+        layout = {"type": (0, 4), "offset": (8, 8), "align": (48, 8)}
+    elif elf_class == 1:  # 32-bit
+        e_phoff = int.from_bytes(blob[0x1C:0x20], "little")
+        e_phentsize = int.from_bytes(blob[0x2A:0x2C], "little")
+        e_phnum = int.from_bytes(blob[0x2C:0x2E], "little")
+        layout = {"type": (0, 4), "offset": (4, 4), "align": (28, 4)}
+    else:
+        return []
+
+    def field(header, name):
+        start, size = layout[name]
+        return int.from_bytes(header[start:start + size], "little")
+
+    segments = []
+    for i in range(e_phnum):
+        at = e_phoff + i * e_phentsize
+        header = blob[at:at + e_phentsize]
+        if len(header) < e_phentsize:
+            break
+        if field(header, "type") != PT_LOAD:
+            continue
+        segments.append((field(header, "align"), field(header, "offset")))
+    return segments
+
+
+def check_page_alignment(entry: str, blob: bytes) -> None:
+    segments = load_segment_alignments(blob)
+    if not segments:
+        raise SystemExit(f"{entry} has no PT_LOAD segments to check")
+    for align, offset in segments:
+        if align < PAGE_16K:
+            raise SystemExit(
+                f"{entry}: a PT_LOAD segment is aligned to {align} bytes, not 16 KB - "
+                "this library cannot load on an Android 15+ 16 KB-page device"
+            )
+        if offset % PAGE_16K != 0:
+            raise SystemExit(
+                f"{entry}: a PT_LOAD segment starts at file offset {offset}, which is "
+                "not a multiple of 16 KB - the installer will reject it"
+            )
+
+
 def check_layout(apk: Path) -> None:
     with zipfile.ZipFile(apk) as archive:
         names = set(archive.namelist())
@@ -113,8 +173,11 @@ def check_layout(apk: Path) -> None:
                     raise SystemExit(f"{entry} is ELF machine {actual}, expected {machine} ({abi})")
             if len(set(digests)) != 1:
                 raise SystemExit(f"{abi}: the library aliases differ, they must be one library")
+            for entry in entries:
+                check_page_alignment(entry, archive.read(entry))
         print(f"layout OK: {len(names)} entries, four ABIs, "
-              f"{len(LIBRARY_ALIASES)} library names per ABI, assets present")
+              f"{len(LIBRARY_ALIASES)} library names per ABI, 16 KB page alignment, "
+              "assets present")
 
 
 def check_badging(aapt2: Path, apk: Path, expected_version: str) -> None:
