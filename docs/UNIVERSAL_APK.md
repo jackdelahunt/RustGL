@@ -117,6 +117,10 @@ differently for this plugin.
 | **26.2+** | An **experimental Vulkan renderer**, chosen in *Options -> Video Settings -> Graphics API* | It needs Vulkan 1.2 with dynamic rendering and push descriptors, and falls back to OpenGL where that is missing [1](https://www.minecraft.net/en-us/article/minecraft-26-2-snapshot-1). A GE8300 has no usable Vulkan 1.2, so the game picks OpenGL by itself. To force it on a device whose Vulkan driver is present but bad, set `preferredGraphicsBackend:"opengl"` in the instance's `options.txt` - the same fix Mojang documented for 26.2 Pre-Release 1 [2](https://endgametools.com/en/minecraft/news/minecraft-vulkan). This plugin is the OpenGL path; it cannot serve the Vulkan one. |
 | **26.3+** | Window, input and platform integration moved from **GLFW to SDL3** [3](https://www.minecraft.net/en-us/article/minecraft-26-3-snapshot-4) | This plugin provides GL and EGL, not a windowing backend. The **launcher** has to supply SDL3 (as it supplies a GLFW stub today) and point it at this library: SDL3 reads `SDL_EGL_LIBRARY` and `SDL_OPENGL_LIBRARY` hints for that [4](https://wiki.libsdl.org/SDL3/SDL_HINT_EGL_LIBRARY). Prepared for it: our EGL now also answers the platform entry points SDL3 tries first - `eglGetPlatformDisplay`, `eglGetPlatformDisplayEXT` and `eglCreatePlatformWindowSurface(EXT)` - each forwarding to the system EGL and falling back to the EGL 1.4 spelling when the driver does not have it [5](https://github.com/spurious/SDL-mirror/blob/master/src/video/SDL_egl.c). |
 
+**For 26.3+, see [`docs/SDL3_LAUNCHERS.md`](SDL3_LAUNCHERS.md)**: what the launcher has to
+supply, the `SDL_EGL_LIBRARY` hint that points SDL3 at this renderer, and the state of
+SDL3 support in the launchers this APK targets.
+
 **WebGPU is not the answer to any of this**, and it is worth saying why rather than
 nodding along:
 

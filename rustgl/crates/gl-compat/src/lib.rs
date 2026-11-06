@@ -3330,8 +3330,6 @@ egl_export!(eglGetConfigAttrib(dpy: *mut c_void, config: *mut c_void, attr: i32,
 egl_export!(eglCreateWindowSurface(dpy: *mut c_void, config: *mut c_void, win: *mut c_void, attrib: *const i32) -> *mut c_void);
 egl_export!(eglCreatePbufferSurface(dpy: *mut c_void, config: *mut c_void, attrib: *const i32) -> *mut c_void);
 egl_export!(eglDestroySurface(dpy: *mut c_void, surface: *mut c_void) -> u32);
-egl_export!(eglBindAPI(api: u32) -> u32);
-egl_export!(eglCreateContext(dpy: *mut c_void, config: *mut c_void, share: *mut c_void, attrib: *const i32) -> *mut c_void);
 egl_export!(eglDestroyContext(dpy: *mut c_void, ctx: *mut c_void) -> u32);
 egl_export!(eglGetCurrentContext() -> *mut c_void);
 egl_export!(eglGetCurrentDisplay() -> *mut c_void);
@@ -3348,7 +3346,176 @@ egl_export!(eglWaitClient() -> u32);
 egl_export!(eglWaitGL() -> u32);
 egl_export!(eglWaitNative(engine: i32) -> u32);
 egl_export!(eglQueryContext(dpy: *mut c_void, ctx: *mut c_void, attr: i32, value: *mut i32) -> u32);
-egl_export!(eglQueryAPI() -> u32);
+
+// =============================================================================
+// Context creation: a desktop-GL request has to become an ES request
+//
+// There is no desktop OpenGL on Android. Minecraft asks for what it asks on a PC - an
+// OpenGL 3.3 core, forward-compatible context - and on Android that has to arrive as
+// ES 3.x: EGL_CONTEXT_MAJOR_VERSION/MINOR_VERSION and the profile mask are EGL 1.5
+// desktop-GL attributes that an Android driver rejects, and EGL_CONTEXT_CLIENT_VERSION
+// is the one it understands. Minecraft 26.3+ makes this worse, because it creates the
+// context through SDL3 with the same PC attributes instead of through a launcher stub
+// that already knows better.
+//
+// So `eglCreateContext` rewrites what cannot work into what can. A request that already
+// names an ES version is passed through untouched - every launcher today does that, and
+// this must not change behaviour for them.
+// =============================================================================
+
+/// `EGL_CONTEXT_CLIENT_VERSION` and `EGL_CONTEXT_MAJOR_VERSION` are the same token -
+/// 0x3098 - in Khronos' egl.h: for an ES context it names the ES version, for a
+/// desktop-GL context the GL major version. Which one a list means is decided by the API
+/// the caller bound, not by the number, so the rewrite below keys off `bound_api` and an
+/// ES request is left strictly alone.
+const EGL_NONE: i32 = 0x3038;
+const EGL_OPENGL_ES_API: u32 = 0x30A0;
+const EGL_OPENGL_API: u32 = 0x30A2;
+const EGL_CONTEXT_VERSION: i32 = 0x3098; // CLIENT_VERSION for ES, MAJOR_VERSION for GL
+const EGL_CONTEXT_MINOR_VERSION: i32 = 0x30FB;
+const EGL_CONTEXT_FLAGS: i32 = 0x30FC;
+const EGL_CONTEXT_OPENGL_PROFILE_MASK: i32 = 0x30FD;
+
+/// What the caller *asked* for. Android can only answer with ES, but the lie has to be
+/// consistent: a game that binds EGL_OPENGL_API and then queries it must hear
+/// EGL_OPENGL_API back, or it will reject the context it just got.
+static BOUND_API: AtomicU32 = AtomicU32::new(EGL_OPENGL_ES_API);
+
+/// Rewrites a **desktop-GL** context attribute list into one an Android EGL driver can
+/// satisfy. Returns the list and whether anything was rewritten.
+///
+/// An ES request - which is what every launcher today makes, and what the ES path of SDL3
+/// makes - is returned untouched: changing it could only break working setups. Only the
+/// attributes that no ES driver accepts are removed:
+///
+/// * the version token is kept, pinned to 3 (the context is ES 3.x either way, and the
+///   version *string* the game sees is spoofed separately);
+/// * the GL minor version, the GL profile mask and the GL context flags (which carry the
+///   forward-compatible and debug bits) have no ES meaning and are dropped.
+fn normalize_context_attribs(attribs: &[i32], bound_api: u32) -> (Vec<i32>, bool) {
+    if bound_api != EGL_OPENGL_API {
+        return (attribs.to_vec(), false);
+    }
+    let mut out: Vec<i32> = Vec::with_capacity(attribs.len() + 4);
+    let mut changed = false;
+    let mut have_version = false;
+
+    let mut i = 0;
+    while i + 1 < attribs.len() {
+        let key = attribs[i];
+        let value = attribs[i + 1];
+        if key == EGL_NONE {
+            break;
+        }
+        match key {
+            EGL_CONTEXT_VERSION => {
+                have_version = true;
+                changed |= value != 3;
+                out.push(EGL_CONTEXT_VERSION);
+                out.push(3);
+            }
+            EGL_CONTEXT_MINOR_VERSION | EGL_CONTEXT_OPENGL_PROFILE_MASK | EGL_CONTEXT_FLAGS => {
+                changed = true;
+            }
+            _ => {
+                out.push(key);
+                out.push(value);
+            }
+        }
+        i += 2;
+    }
+    if !have_version {
+        changed = true;
+        out.push(EGL_CONTEXT_VERSION);
+        out.push(3);
+    }
+    out.push(EGL_NONE);
+    (out, changed)
+}
+
+/// Reads a context attribute list, or an empty one when the caller passed null.
+unsafe fn read_attrib_list(attribs: *const i32) -> Vec<i32> {
+    if attribs.is_null() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut i = 0;
+    loop {
+        let v = *attribs.add(i);
+        out.push(v);
+        if v == EGL_NONE {
+            return out;
+        }
+        i += 1;
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglCreateContext(
+    dpy: *mut c_void,
+    config: *mut c_void,
+    share: *mut c_void,
+    attrib: *const i32,
+) -> *mut c_void {
+    type F = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *const i32) -> *mut c_void;
+    let asked = read_attrib_list(attrib);
+    let (normalized, changed) = normalize_context_attribs(&asked, BOUND_API.load(Ordering::Relaxed));
+    let list = if changed { normalized } else { asked.clone() };
+    let ptr = if list.is_empty() {
+        std::ptr::null()
+    } else {
+        list.as_ptr()
+    };
+    let ctx = match egl_sym::<F>(b"eglCreateContext\0") {
+        Some(f) => f(dpy, config, share, ptr),
+        None => std::ptr::null_mut(),
+    };
+    if ctx.is_null() && changed {
+        // The rewrite is the only thing that differs from what the caller asked for; if
+        // the driver still refuses, try the original list before giving up.
+        log("[GLBridge] normalised context attributes were refused; retrying verbatim");
+        let original = if asked.is_empty() { std::ptr::null() } else { asked.as_ptr() };
+        if let Some(f) = egl_sym::<F>(b"eglCreateContext\0") {
+            return f(dpy, config, share, original);
+        }
+        return std::ptr::null_mut();
+    }
+    if changed && !ctx.is_null() {
+        log("[GLBridge] eglCreateContext: desktop-GL attributes rewritten to ES 3");
+    }
+    ctx
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglBindAPI(api: u32) -> u32 {
+    type F = unsafe extern "C" fn(u32) -> u32;
+    // Only ES contexts exist here, so a desktop-GL bind is answered with an ES bind and
+    // remembered as what was asked.
+    let asked = if api == EGL_OPENGL_API { EGL_OPENGL_ES_API } else { api };
+    let result = match egl_sym::<F>(b"eglBindAPI\0") {
+        Some(f) => f(asked),
+        None => 0x3000, // EGL_NOT_INITIALIZED
+    };
+    BOUND_API.store(api, Ordering::Relaxed);
+    if api == EGL_OPENGL_API {
+        log("[GLBridge] eglBindAPI(OPENGL_API) -> bound ES: no desktop GL on Android");
+    }
+    result
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglQueryAPI() -> u32 {
+    type F = unsafe extern "C" fn() -> u32;
+    let bound = BOUND_API.load(Ordering::Relaxed);
+    if bound == EGL_OPENGL_API {
+        // Report what the caller bound: it has to recognise its own context.
+        return EGL_OPENGL_API;
+    }
+    match egl_sym::<F>(b"eglQueryAPI\0") {
+        Some(f) => f(),
+        None => bound,
+    }
+}
 
 // =============================================================================
 // EGL 1.5 / EGL_EXT_platform_base - the path SDL3 takes first
@@ -3954,6 +4121,59 @@ mod tests {
         let out = unsafe { egl_attribs_as_int(list.as_ptr()) }.expect("converted");
         assert_eq!(out, vec![0x3033i32, 4, 0x3024, 8, 0]);
         assert_eq!(out.last(), Some(&0), "the EGL_NONE terminator is kept");
+    }
+
+    #[test]
+    fn an_es_context_request_is_left_alone() {
+        // What every launcher builds today, and what SDL3's ES path builds: untouched.
+        let attribs = [EGL_CONTEXT_VERSION, 3, EGL_NONE];
+        let (out, changed) = normalize_context_attribs(&attribs, EGL_OPENGL_ES_API);
+        assert!(!changed);
+        assert_eq!(out, vec![EGL_CONTEXT_VERSION, 3, EGL_NONE]);
+        // Even a desktop-looking list is untouched while ES is bound: the caller knows.
+        let attribs = [EGL_CONTEXT_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 0, EGL_NONE];
+        let (_, changed) = normalize_context_attribs(&attribs, EGL_OPENGL_ES_API);
+        assert!(!changed);
+    }
+
+    #[test]
+    fn a_desktop_gl_context_request_becomes_es_3() {
+        // What Minecraft asks for on a PC, and now through SDL3: GL 3.3 core, forward
+        // compatible. No Android EGL driver accepts this list.
+        let attribs = [
+            EGL_CONTEXT_VERSION,
+            3,
+            EGL_CONTEXT_MINOR_VERSION,
+            3,
+            EGL_CONTEXT_OPENGL_PROFILE_MASK,
+            0x0001, // EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT
+            EGL_CONTEXT_FLAGS,
+            0x0002, // EGL_CONTEXT_OPENGL_FORWARD_COMPATIBLE_BIT
+            EGL_NONE,
+        ];
+        let (out, changed) = normalize_context_attribs(&attribs, EGL_OPENGL_API);
+        assert!(changed);
+        assert!(out.windows(2).any(|w| w == [EGL_CONTEXT_VERSION, 3]), "{out:?}");
+        assert!(!out.contains(&EGL_CONTEXT_MINOR_VERSION), "{out:?}");
+        assert!(!out.contains(&EGL_CONTEXT_OPENGL_PROFILE_MASK), "{out:?}");
+        assert!(!out.contains(&EGL_CONTEXT_FLAGS), "{out:?}");
+        assert_eq!(*out.last().unwrap(), EGL_NONE, "still terminated");
+    }
+
+    #[test]
+    fn a_desktop_request_without_a_version_still_gets_one() {
+        let (out, changed) = normalize_context_attribs(&[EGL_NONE], EGL_OPENGL_API);
+        assert!(changed);
+        assert_eq!(out, vec![EGL_CONTEXT_VERSION, 3, EGL_NONE]);
+    }
+
+    #[test]
+    fn attributes_that_es_accepts_survive_the_rewrite() {
+        // EGL_CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY (0x31BD) is valid for ES too.
+        let attribs = [EGL_CONTEXT_VERSION, 4, 0x31BD, 0x31BE, EGL_NONE];
+        let (out, changed) = normalize_context_attribs(&attribs, EGL_OPENGL_API);
+        assert!(changed);
+        assert!(out.windows(2).any(|w| w == [0x31BD, 0x31BE]), "{out:?}");
     }
 
     #[test]

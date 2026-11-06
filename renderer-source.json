@@ -18,7 +18,7 @@
     {
       "path": "crates/gl-compat/src/lib.rs",
       "upstreamBlob": "91c8b7fd74437f60ba97a5b8f889f886f24e08a3",
-      "summary": "driver entry-point cache takes a shared read lock on the hit path; shader translation results are memoized under a bounded cache; compile/link status is read lazily when the driver supports GL_KHR_parallel_shader_compile; glUseProgram/glDeleteProgram track the current program; GLSL-only extensions shader packs probe for are advertised under their own tested table; eglSwapBuffers can time frames (RENDERER_FRAME_STATS=1); and the EGL 1.5 / EGL_EXT_platform_base entry points SDL3 (Minecraft 26.3+) tries first are served by forwarding to the system EGL with an EGL 1.4 fallback."
+      "summary": "driver entry-point cache takes a shared read lock on the hit path; shader translation results are memoized under a bounded cache; compile/link status is read lazily when the driver supports GL_KHR_parallel_shader_compile; glUseProgram/glDeleteProgram track the current program; GLSL-only extensions shader packs probe for are advertised under their own tested table; eglSwapBuffers can time frames (RENDERER_FRAME_STATS=1); the EGL 1.5 / EGL_EXT_platform_base entry points SDL3 tries first are served by forwarding with an EGL 1.4 fallback; and a desktop-GL context request (the one Minecraft 26.3+ makes through SDL3) is rewritten into an ES 3 request, while an ES request is left strictly alone."
     },
     {
       "path": "crates/gl-compat/src/gl/v3_3.rs",

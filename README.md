@@ -18,6 +18,7 @@ plugin APK** for Minecraft: Java Edition launchers on Android.
 | `tests/` | Contract tests for the manifest, the v2 config and the packaging helpers - plain Python, no SDK. |
 | `src/`, `res/` | The original desktop RustGL demo (SDL2 + OpenGL) this repository started as. Kept for reference; it is not part of the Android plugin. |
 | `docs/UNIVERSAL_APK.md` | Install, per-launcher notes, environment variables, limitations, the Minecraft 26.x situation (Vulkan renderer, the SDL3 switch), signing and rebuild instructions. |
+| `docs/SDL3_LAUNCHERS.md` | What a launcher must provide for Minecraft 26.3+ now that the game uses SDL3 instead of GLFW: the SDL3 library, the `SDL_EGL_LIBRARY` hint that routes it to this renderer, what this layer normalises, and the state of SDL3 support in the launchers this APK targets. |
 | `docs/PERFORMANCE.md` | What was optimized in the renderer (per-call locking, shader translation caching, compile/link stalls, per-draw allocations), how the driver capability tiers work, how **shader packs** work on this renderer (OptiFine 1.7.10-1.12.2 and Iris/Sodium), and what is **not** measured. |
 
 ## Shader packs
