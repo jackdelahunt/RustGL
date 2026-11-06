@@ -50,12 +50,12 @@ that must be set before the first window or context is created
 `SDL_HINT_OPENGL_LIBRARY`, both since SDL 3.2.0):
 
 ```
-SDL_EGL_LIBRARY     = <nativeLibraryDir>/librust_gl.so
-SDL_OPENGL_LIBRARY  = <nativeLibraryDir>/librust_gl.so
+SDL_EGL_LIBRARY     = <nativeLibraryDir>/librustgl.so
+SDL_OPENGL_LIBRARY  = <nativeLibraryDir>/librustgl.so
 ```
 
 This plugin already re-exports EGL and is already installed as the EGL library by
-the v1 plugin contract (its `renderer` meta-data carries `/librust_gl.so` for
+the v1 plugin contract (its `renderer` meta-data carries `/librustgl.so` for
 exactly that reason — a leading `/` makes every documented v1 launcher prepend
 the plugin's native library directory). The same absolute path is what the SDL3
 hints need. If SDL3 loads the system EGL instead, **this plugin is bypassed
@@ -120,7 +120,7 @@ issues and pull requests, not from testing each launcher.
 1. Provide SDL3 for Android (real SDL3 or a hook), wired to your surface and
    input, with JNI/VM isolation as needed.
 2. Set `SDL_EGL_LIBRARY` and `SDL_OPENGL_LIBRARY` to the absolute path of
-   `librust_gl.so` **before** the first window or context.
+   `librustgl.so` **before** the first window or context.
 3. Ask for an ES context (`SDL_GL_CONTEXT_PROFILE_MASK` = ES, version 3.x).
    If you cannot, this layer will normalise a desktop-GL request for you — but
    asking correctly is better, and it is what your existing GLFW stub already

@@ -128,7 +128,7 @@ not sit in the middle of the fast one.
 ### 9. Frame-time percentiles, so the next claim can be measured (`crates/gl-compat/src/lib.rs`)
 
 Every documented number above is a cost removed, not a frame rate gained, because nothing
-here has been run on a phone. That is now fixable by whoever has the phone: `librust_gl.so`
+here has been run on a phone. That is now fixable by whoever has the phone: `librustgl.so`
 re-exports EGL, so every presented frame goes through its `eglSwapBuffers`, and with
 `RENDERER_FRAME_STATS=1` it times them.
 
@@ -241,7 +241,7 @@ here, and it says so in the log instead of showing you a black screen.
 ## Optimizations that do not belong in this layer
 
 Checklists for a fast Minecraft renderer are mostly about the renderer, and this
-repository is a **compatibility layer**: `librust_gl.so` receives desktop OpenGL
+repository is a **compatibility layer**: `librustgl.so` receives desktop OpenGL
 calls from the game, rewrites what ES cannot express, and forwards to the GLES
 driver the launcher chose. It does not own the render loop, the window, the
 world, or the JVM. Concretely:

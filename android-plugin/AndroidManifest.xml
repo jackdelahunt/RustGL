@@ -11,7 +11,7 @@
       `pojavEnv`, `boatEnv`) - Zalith Launcher 1 / Gurkha Launcher, FCL's legacy
       path, and Pojav-family forks (Mojo Launcher and others) that kept the FCL
       v1 metadata reader.
-    * The plain native library (`lib/<abi>/librust_gl.so`) plus the per-ABI ZIPs
+    * The plain native library (`lib/<abi>/librustgl.so`) plus the per-ABI ZIPs
       and the local-import ZIP published with every release, for launchers that
       have no plugin loader at all.
 
@@ -23,15 +23,15 @@
   The v1 `renderer` value is "<renderer id>:<gl library>:<egl library>". The EGL
   name starts with "/", which makes every documented v1 launcher prepend the
   plugin's nativeLibraryDir (RendererPlugin-v2 LegacyManifestBuilder: "以 `/`
-  开头时，启动器将自动拼接插件的 nativeLibraryDir"). A bare "librust_gl.so" would
+  开头时，启动器将自动拼接插件的 nativeLibraryDir"). A bare "librustgl.so" would
   only resolve if the game process happened to have the plugin's library
-  directory on its search path. librust_gl.so re-exports EGL, so the same file
+  directory on its search path. librustgl.so re-exports EGL, so the same file
   is both the GL and the EGL library.
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="np.com.gurkha.rustgl.plugin"
-    android:versionCode="9"
-    android:versionName="0.3.0-gurkha.9">
+    android:versionCode="10"
+    android:versionName="0.3.0-gurkha.10">
 
     <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="34" />
 
@@ -103,7 +103,7 @@
              private id such as "opengles3_rust" makes that code fall through. -->
         <meta-data
             android:name="renderer"
-            android:value="opengles3:librust_gl.so:/librust_gl.so" />
+            android:value="opengles3:librustgl.so:/librustgl.so" />
         <meta-data
             android:name="des"
             android:value="RustGL (Gurkha build) - OpenGL 4.5 surface on OpenGL ES 3 [v1 plugin API]" />

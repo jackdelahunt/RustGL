@@ -53,7 +53,7 @@ jobs:
           PY
 
   RendererLibraries:
-    name: Build librust_gl.so (4 ABIs)
+    name: Build the renderer (4 ABIs)
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7

@@ -60,13 +60,12 @@ TITLES = {
     "rustgl_framestats_title": "Log frame-time percentiles (p50/p95/p99, log only)",
 }
 
-# Launchers look for this renderer under two names: the one it is built as, and the
-# spelling without the underscore, which some of them derive from the plugin's display
-# name and then fail on with "librustgl.so missing". Both are the same library, and an APK
-# cannot carry a working symlink, so each ABI ships a copy under each name. That costs the
-# size of the library again per ABI; it is cheaper than a renderer that will not load.
-LIBRARY_NAME = "librust_gl.so"
-LIBRARY_ALIASES = ("librust_gl.so", "librustgl.so")
+# What cargo produces, and what ships. They differ on purpose: launchers ask for the
+# library under the name they derive from the plugin's display name - "RustGL" becomes
+# librustgl.so - and they load that name, not the one the crate happens to be called. A
+# library shipped as librust_gl.so is a library those launchers never find.
+LIBRARY_BUILD_NAME = "librust_gl.so"
+LIBRARY_NAME = "librustgl.so"
 
 PACKAGE_NAME = "np.com.gurkha.rustgl.plugin"
 APP_LABEL = "RustGL (Gurkha build)"
@@ -165,7 +164,7 @@ def verify_elf(path: Path, abi: str) -> None:
 def collect_libraries(native_dir: Path):
     libraries = {}
     for abi in ABIS:
-        library = native_dir / abi / "librust_gl.so"
+        library = native_dir / abi / LIBRARY_BUILD_NAME
         if not library.is_file():
             raise SystemExit(f"Missing {library}; build the renderer for every ABI first")
         verify_elf(library, abi)
@@ -209,9 +208,9 @@ def write_local_import(target: Path, build_info: dict) -> None:
         "pluginVersion": 1,
         "rendererId": "opengles3_rust",
         "rendererDisplayName": APP_LABEL,
-        "glName": "librust_gl.so",
+        "glName": LIBRARY_NAME,
         # A leading "/" makes the launcher prepend libs/<arch> of the imported folder.
-        "eglName": "/librust_gl.so",
+        "eglName": f"/{LIBRARY_NAME}",
         "boatEnv": {
             "LIBGL_ES": "3",
             "RENDERER_BACKEND": "gles",
@@ -229,8 +228,7 @@ def write_local_import(target: Path, build_info: dict) -> None:
     with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("config", (len(payload)).to_bytes(2, "big") + payload)
         for abi, info in build_info["libraries"].items():
-            for name in LIBRARY_ALIASES:
-                archive.write(info["path"], f"libs/{abi}/{name}")
+            archive.write(info["path"], f"libs/{abi}/{LIBRARY_NAME}")
         archive.writestr("README.txt", (DOCS / "UNIVERSAL_APK.md").read_text(encoding="utf-8"))
 
 
@@ -240,15 +238,13 @@ def write_abi_zips(output: Path, build_info: dict) -> None:
         metadata = {
             "abi": abi,
             "library": LIBRARY_NAME,
-            "aliases": list(LIBRARY_ALIASES),
             "sha256": info["sha256"],
             "size": info["size"],
             "version": build_info["versionName"],
             "source": build_info.get("source"),
         }
         with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
-            for name in LIBRARY_ALIASES:
-                archive.write(info["path"], name)
+            archive.write(info["path"], LIBRARY_NAME)
             archive.writestr("build.json", json.dumps(metadata, indent=2) + "\n")
             archive.writestr("README.txt", (DOCS / "UNIVERSAL_APK.md").read_text(encoding="utf-8"))
             if (ROOT / "NOTICE").exists():
@@ -265,8 +261,7 @@ def prepare_assets(staging: Path, build_info: dict, config_json: str) -> None:
         shutil.copy2(ROOT / "NOTICE", assets / "NOTICE")
     for abi in ABIS:
         (staging / "lib" / abi).mkdir(parents=True, exist_ok=True)
-        for name in LIBRARY_ALIASES:
-            shutil.copy2(build_info["libraries"][abi]["path"], staging / "lib" / abi / name)
+        shutil.copy2(build_info["libraries"][abi]["path"], staging / "lib" / abi / LIBRARY_NAME)
 
 
 def keystore(tmp: Path):
@@ -313,7 +308,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--native", type=Path, default=ROOT / "artifacts" / "rustgl",
-                        help="directory with <abi>/librust_gl.so")
+                        help=f"directory with <abi>/{LIBRARY_BUILD_NAME}")
     parser.add_argument("--sdk", type=Path, default=os.environ.get("ANDROID_HOME"),
                         help="Android SDK root (default: $ANDROID_HOME)")
     parser.add_argument("--output", type=Path, default=ROOT / "artifacts" / "release")

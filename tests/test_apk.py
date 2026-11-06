@@ -99,11 +99,12 @@ class ManifestTests(unittest.TestCase):
         renderer_id, gl_name, egl_name = meta_data()["renderer"].split(":")
         # "opengles3" is the id every launcher understands; MobileGL uses it too.
         self.assertEqual(renderer_id, "opengles3")
-        self.assertEqual(gl_name, "librust_gl.so")
+        # The name launchers derive from the plugin's display name and then load.
+        self.assertEqual(gl_name, "librustgl.so")
         # A leading "/" is what makes every documented v1 launcher prepend the
         # plugin's nativeLibraryDir; a bare name only resolves by luck.
         self.assertTrue(egl_name.startswith("/"))
-        self.assertEqual(egl_name.lstrip("/"), "librust_gl.so")
+        self.assertEqual(egl_name.lstrip("/"), "librustgl.so")
 
     def test_16kb_page_alignment_is_detected_either_way(self):
         """A synthetic ELF: one PT_LOAD, 64-bit then 32-bit, aligned and misaligned."""
@@ -157,14 +158,16 @@ class ManifestTests(unittest.TestCase):
                 verify_apk.check_page_alignment("skew.so", elf(elf_class, 16384, 0x4000, vaddr=0x1000))
         self.assertEqual(verify_apk.load_segment_alignments(b"not an elf"), [])
 
-    def test_every_abi_ships_the_library_under_both_names(self):
-        # Some launchers ask for librustgl.so - the name without the underscore - and
-        # crash with "librustgl.so missing" when only librust_gl.so is there.
-        self.assertIn("librust_gl.so", package_apk.LIBRARY_ALIASES)
-        self.assertIn("librustgl.so", package_apk.LIBRARY_ALIASES)
+    def test_the_library_ships_under_the_name_launchers_load(self):
+        # Launchers load the name they derive from the plugin's display name - "RustGL"
+        # becomes librustgl.so - and that is the only name the APK carries. Shipping the
+        # crate's own name, librust_gl.so, is what left it unreachable.
+        self.assertEqual(package_apk.LIBRARY_NAME, "librustgl.so")
+        self.assertNotIn("librustgl.so".replace("rustgl", "rust_gl"),
+                         [package_apk.LIBRARY_NAME])
         doc = (ROOT / "docs" / "UNIVERSAL_APK.md").read_text(encoding="utf-8")
         self.assertIn("librustgl.so", doc,
-                      "the second library name is documented, or nobody will know why it ships")
+                      "the shipped library name is documented, or nobody will know it changed")
 
     def test_v1_environment_is_parseable(self):
         for key in ("pojavEnv", "boatEnv", "h2co3Env"):
@@ -202,10 +205,10 @@ class RendererConfigTests(unittest.TestCase):
     def test_library_paths(self):
         # "**|" is replaced with the plugin's nativeLibraryDir by both launchers.
         self.assertTrue(self.config["rendererGLPath"].startswith("**|"))
-        self.assertEqual(self.config["rendererGLPath"], "**|librust_gl.so")
+        self.assertEqual(self.config["rendererGLPath"], "**|librustgl.so")
         # The EGL library must be resolved the same way: a bare name only loads
         # if the game process happens to have the plugin's library dir on its path.
-        self.assertEqual(self.config["rendererEGLPath"], "**|librust_gl.so")
+        self.assertEqual(self.config["rendererEGLPath"], "**|librustgl.so")
         self.assertEqual(self.config["dlopenLibPaths"], [])
 
     def test_environment(self):
@@ -296,11 +299,12 @@ class PackagingTests(unittest.TestCase):
                 self.assertEqual(length, len(blob) - 2)
                 config = json.loads(blob[2:].decode("utf-8"))
             self.assertEqual(config["rendererId"], "opengles3_rust")
-            self.assertEqual(config["glName"], "librust_gl.so")
+            self.assertEqual(config["glName"], "librustgl.so")
             self.assertTrue(config["eglName"].startswith("/"))
             self.assertIn("JAVA_TOOL_OPTIONS", config["pojavEnv"])
             for abi in ABIS:
-                self.assertIn(f"libs/{abi}/librust_gl.so", names)
+                self.assertIn(f"libs/{abi}/librustgl.so", names)
+                self.assertNotIn(f"libs/{abi}/librust_gl.so", names)
 
 
 class SourceSyncTests(unittest.TestCase):

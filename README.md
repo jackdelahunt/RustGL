@@ -12,7 +12,7 @@ plugin APK** for Minecraft: Java Edition launchers on Android.
 
 | Path | What it is |
 |---|---|
-| `rustgl/` | The renderer: a Rust workspace whose `gl-compat` crate builds `librust_gl.so`. Synced from [`Gurkha Launcher`](https://github.com/kushaladhikari982648-lgtm/Gurkha-launcher) (`rustgl/`, branch `arena/a8e9723f-gurkha-launcher`, commit `1726782a`) plus the local changes listed in `renderer-source.json` - see [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md). `python3 tools/check_sync.py` proves every other file is byte-identical. |
+| `rustgl/` | The renderer: a Rust workspace whose `gl-compat` crate builds the renderer; packaging ships it as `librustgl.so`. Synced from [`Gurkha Launcher`](https://github.com/kushaladhikari982648-lgtm/Gurkha-launcher) (`rustgl/`, branch `arena/a8e9723f-gurkha-launcher`, commit `1726782a`) plus the local changes listed in `renderer-source.json` - see [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md). `python3 tools/check_sync.py` proves every other file is byte-identical. |
 | `android-plugin/` | The plugin: `AndroidManifest.xml` (RendererPlugin v2 + v1 meta-data), the v2 JSON config, and the single information `Activity`. |
 | `tools/` | `package_apk.py` (aapt2 + javac + d8 + zipalign + apksigner, no Gradle), `verify_apk.py` (post-build contract checks), `collect_native.py`, `check_sync.py`. |
 | `tests/` | Contract tests for the manifest, the v2 config and the packaging helpers - plain Python, no SDK. |
@@ -42,7 +42,7 @@ running end to end on a phone; see the closing section of
 
 ## The universal APK
 
-`rustgl-universal-<version>.apk` ships `librust_gl.so` for **arm64-v8a,
+`rustgl-universal-<version>.apk` ships `librustgl.so` for **arm64-v8a,
 armeabi-v7a, x86 and x86_64** in one package and declares the plugin contracts
 used by the Pojav-family launchers, so the same file can be installed and
 selected as a renderer in:
@@ -70,7 +70,7 @@ renderer.
 **Download:** <https://github.com/kushaladhikari982648-lgtm/RustGL-for-Gurkha-launcher/releases/latest>
 - install `rustgl-universal-<version>.apk` (2.3 MB, four ABIs in one file),
 - or `rustgl-local-import.zip` for launchers that import renderer folders,
-- or `rustgl-gurkha-<abi>.zip` for a bare `librust_gl.so`.
+- or `rustgl-gurkha-<abi>.zip` for a bare `librustgl.so`.
 
 Install, selection and honest limitations: **[docs/UNIVERSAL_APK.md](docs/UNIVERSAL_APK.md)**.
 

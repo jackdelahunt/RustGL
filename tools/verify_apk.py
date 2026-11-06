@@ -20,7 +20,6 @@ Checks, in order:
 """
 
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -30,7 +29,7 @@ import sys
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-from package_apk import LIBRARY_ALIASES  # noqa: E402
+from package_apk import LIBRARY_NAME  # noqa: E402
 
 ABIS = {
     "arm64-v8a": (2, 183),
@@ -162,30 +161,22 @@ def check_layout(apk: Path) -> None:
             if required not in names:
                 raise SystemExit(f"{apk.name} is missing {required}")
         for abi, (elf_class, machine) in ABIS.items():
-            # Both spellings of the library name have to be present and identical: a
-            # launcher that asks for librustgl.so gets exactly what librust_gl.so is.
-            entries = [f"lib/{abi}/{name}" for name in LIBRARY_ALIASES]
-            digests = []
-            for entry in entries:
-                if entry not in names:
-                    raise SystemExit(f"{apk.name} is missing {entry}")
-                blob = archive.read(entry)
-                digests.append(hashlib.sha256(blob).hexdigest())
-                header = blob[:20]
-                if header[:4] != b"\x7fELF":
-                    raise SystemExit(f"{entry} is not an ELF file")
-                if header[4] != elf_class or header[5] != 1:
-                    raise SystemExit(f"{entry} is not a little-endian ELF{elf_class * 32}")
-                actual = int.from_bytes(header[18:20], "little")
-                if actual != machine:
-                    raise SystemExit(f"{entry} is ELF machine {actual}, expected {machine} ({abi})")
-            if len(set(digests)) != 1:
-                raise SystemExit(f"{abi}: the library aliases differ, they must be one library")
-            for entry in entries:
-                check_page_alignment(entry, archive.read(entry))
+            # The library has to be there under the name launchers actually load.
+            entry = f"lib/{abi}/{LIBRARY_NAME}"
+            if entry not in names:
+                raise SystemExit(f"{apk.name} is missing {entry}")
+            blob = archive.read(entry)
+            header = blob[:20]
+            if header[:4] != b"\x7fELF":
+                raise SystemExit(f"{entry} is not an ELF file")
+            if header[4] != elf_class or header[5] != 1:
+                raise SystemExit(f"{entry} is not a little-endian ELF{elf_class * 32}")
+            actual = int.from_bytes(header[18:20], "little")
+            if actual != machine:
+                raise SystemExit(f"{entry} is ELF machine {actual}, expected {machine} ({abi})")
+            check_page_alignment(entry, blob)
         print(f"layout OK: {len(names)} entries, four ABIs, "
-              f"{len(LIBRARY_ALIASES)} library names per ABI, 16 KB page alignment, "
-              "assets present")
+              f"{LIBRARY_NAME} in each, 16 KB page alignment, assets present")
 
 
 def check_badging(aapt2: Path, apk: Path, expected_version: str) -> None:

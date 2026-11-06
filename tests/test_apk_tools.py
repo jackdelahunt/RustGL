@@ -63,7 +63,7 @@ N: android=http://schemas.android.com/apk/res/android (line=2)
           A: android:value(0x01010024)="LIBGL_ES=3:RENDERER_BACKEND=gles" (Raw: "LIBGL_ES=3:RENDERER_BACKEND=gles")
         E: meta-data (line=63)
           A: android:name(0x01010003)="renderer" (Raw: "renderer")
-          A: android:value(0x01010024)="opengles3:librust_gl.so:/librust_gl.so" (Raw: "opengles3:librust_gl.so:/librust_gl.so")
+          A: android:value(0x01010024)="opengles3:librustgl.so:/librustgl.so" (Raw: "opengles3:librustgl.so:/librustgl.so")
         E: meta-data (line=51)
           A: android:name(0x01010003)="pojavEnv" (Raw: "pojavEnv")
           A: android:value(0x01010024)="LIBGL_ES=3:RENDERER_BACKEND=gles" (Raw: "LIBGL_ES=3:RENDERER_BACKEND=gles")
@@ -99,7 +99,7 @@ class XmlTreeTests(unittest.TestCase):
             meta = verify_apk.parse_meta_data(sample)
             self.assertEqual(meta["fclPlugin"], "true", sample.splitlines()[0])
             self.assertEqual(meta["fclPlugin_V2"], "@resource")
-            self.assertEqual(meta["renderer"], "opengles3:librust_gl.so:/librust_gl.so")
+            self.assertEqual(meta["renderer"], "opengles3:librustgl.so:/librustgl.so")
             self.assertEqual(meta["pojavEnv"], "LIBGL_ES=3:RENDERER_BACKEND=gles")
 
     def test_attribute_value_forms(self):
@@ -149,14 +149,14 @@ class ConfigExtractionTests(unittest.TestCase):
                 'String #0: app_name\n'
                 'String #1: RustGL (Gurkha build)\n'
                 'String #2: {"displayName":"RustGL (Gurkha build)",'
-                '"rendererId":"opengles3_rust","rendererGLPath":"**|librust_gl.so",'
-                '"rendererEGLPath":"librust_gl.so","dlopenLibPaths":[],'
+                '"rendererId":"opengles3_rust","rendererGLPath":"**|librustgl.so",'
+                '"rendererEGLPath":"librustgl.so","dlopenLibPaths":[],'
                 '"env":[{"type":"NormalEnv","key":"LIBGL_ES","value":"3"}],'
                 '"minMCVer":null,"maxMCVer":null}\n'
                 'String #3: rustgl_debug_title\n')
         config = verify_apk.extract_json(pool)
         self.assertEqual(config["rendererId"], "opengles3_rust")
-        self.assertEqual(config["rendererGLPath"], "**|librust_gl.so")
+        self.assertEqual(config["rendererGLPath"], "**|librustgl.so")
         self.assertEqual(config["env"][0]["type"], "NormalEnv")
 
     def test_escaped_json_from_aapt2_dump_strings(self):

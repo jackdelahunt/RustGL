@@ -1,6 +1,6 @@
 # RustGL universal renderer plugin APK
 
-One installable APK (`rustgl-universal-<version>.apk`) carries `librust_gl.so`
+One installable APK (`rustgl-universal-<version>.apk`) carries `librustgl.so`
 for **arm64-v8a, armeabi-v7a, x86 and x86_64** and speaks every renderer-plugin
 contract in use, so the same file is picked up by the different launchers
 instead of only one of them.
@@ -13,7 +13,7 @@ instead of only one of them.
 | RendererPlugin **v1** - Pojav Glow·Worm marker | `pgwRendererPlugin` | Pojav Glow·Worm lineage: PojavLauncher-Beta-Zink, NRC for Android |
 | RendererPlugin **v1** - H2CO3/Boat marker | `h2co3LauncherPlugin` + `h2co3Env` | H2CO3 Launcher (and the Boat family it continues) |
 | Boat/MCinaBox env | `boatEnv` | Boat-style readers that ask for their own env list |
-| Local import / bare library | `lib/<abi>/librust_gl.so` | Launchers with no plugin loader at all: use the per-ABI ZIP or `rustgl-local-import.zip` from the release |
+| Local import / bare library | `lib/<abi>/librustgl.so` | Launchers with no plugin loader at all: use the per-ABI ZIP or `rustgl-local-import.zip` from the release |
 
 All of these readers find the package the same way -
 `PackageManager.queryIntentActivities(Intent.ACTION_MAIN)` - which is why the APK
@@ -44,7 +44,7 @@ inside the launcher: the activity only explains the plugin and holds no settings
    your previous renderer; nothing else is lost.
 
 Some launchers list both the v2 and the v1 entry of this same package. Either
-one loads the same `librust_gl.so`; the v2 entry additionally lets you turn
+one loads the same `librustgl.so`; the v2 entry additionally lets you turn
 `RENDERER_DEBUG`, `RENDERER_TRACE_GL` and `RENDERER_SPOOF_GL` on and off from
 the launcher.
 
@@ -91,7 +91,7 @@ multiple of 16 KB - which is correct, and is what the check now enforces.
 
 If the crash survives 0.3.0-gurkha.9, it is not this. What is needed then is the log:
 `adb logcat` filtered on the launcher, or the launcher's own log export. The useful
-lines name either `librust_gl.so` / `librustgl.so` (a loading problem) or a GL entry
+lines name either `librustgl.so` / `librustgl.so` (a loading problem) or a GL entry
 point (`[GLBridge] Missing entry point: …`, a coverage problem).
 
 Honest limit: the arm64 and x86_64 builds are compiled in CI and pass the same unit tests
@@ -100,24 +100,27 @@ against Mesa on the CI machine only. Nothing here has been run on a 64-bit phone
 
 ## Library names
 
-Every ABI in the APK carries the renderer **twice**, as identical copies:
+The renderer ships as **`librustgl.so`**, and that is the only name it is under.
 
-* `lib/<abi>/librust_gl.so` - the name it is built as, and the one the plugin's own
-  configuration points at.
-* `lib/<abi>/librustgl.so` - the same library under the spelling some launchers ask
-  for. Those launchers derive the library name from the plugin's display name rather
-  than reading `rendererGLPath`, and they fail with "librustgl.so missing" when it is
-  not there.
+It is not the name the crate is built as. Cargo builds `librust_gl.so`, and packaging
+renames it, because the name that matters is the one the launcher derives: launchers take
+the plugin's display name - "RustGL" - and look for `librustgl.so`, with no underscore.
+A library shipped under the crate's own name is one those launchers never find.
 
-An APK cannot carry a working symlink, so the second name is a real copy: the APK
-grows by roughly the size of the library again, per ABI. `tools/verify_apk.py` checks
-that both entries exist and that their bytes are identical, so the two names can never
-drift apart.
+This is why 0.3.0-gurkha.9 shipped both names and 0.3.0-gurkha.10 does not. Two copies
+solved "missing", but they left the launcher free to load either, including the one whose
+name nothing asked for - and that name is what 0.3.0-gurkha.10 removes. The APK is back to
+one copy of the library per ABI, so it is roughly half the size of .9.
+
+`tools/verify_apk.py` checks every ABI for `lib/<abi>/librustgl.so` and refuses the build
+if it is not there. The per-ABI ZIPs and `rustgl-local-import.zip` carry the same name, and
+the plugin's `rendererGLPath` / `rendererEGLPath` and the v1 `renderer` meta-data all point
+at it, so a launcher reading the configuration and a launcher guessing the name agree.
 
 ## What the renderer is
 
 RustGL is a compatibility layer, not a driver. Minecraft talks desktop OpenGL to
-`librust_gl.so`, which rewrites the shaders to GLSL ES, emulates desktop-only
+`librustgl.so`, which rewrites the shaders to GLSL ES, emulates desktop-only
 entry points (fixed-function drawing, display lists, base-vertex draws, buffer
 textures, UBO updates, legacy lightmaps) and forwards to the device's OpenGL ES
 3 driver. With `RENDERER_SPOOF_GL=1` it reports an OpenGL 4.5 core profile to
@@ -149,7 +152,7 @@ Zalith truncates values at the second `=`. If you use the v1 entry on Minecraft
   clean instance without mods or shader packs first.
 - **Launchers without a plugin loader** (stock PojavLauncher, Amethyst, and any
   fork that predates the FCL plugin API) cannot use the APK at all. Use
-  `rustgl-gurkha-<abi>.zip` (bare `librust_gl.so`) and the launcher's own
+  `rustgl-gurkha-<abi>.zip` (bare `librustgl.so`) and the launcher's own
   "custom"/library mechanism, or `rustgl-local-import.zip` for launchers that
   import renderer folders (Zalith, Gurkha: *renderer plugins -> import local*).
 - The **v1 entry** is fixed-environment: its `pojavEnv` cannot contain `=` in a
