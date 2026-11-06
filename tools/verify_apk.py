@@ -326,10 +326,10 @@ def check_config(config: dict, meta: dict) -> None:
     if config["rendererId"] != "opengles3":
         raise SystemExit(f"unexpected rendererId {config['rendererId']!r}: launchers "
                          "derive context hints from it, so it must be the id they know")
-    if config["rendererGLPath"] != "**|librust_gl.so":
+    if config["rendererGLPath"] != f"**|{LIBRARY_NAME}":
         raise SystemExit("rendererGLPath must use the **| plugin-path prefix")
-    if not config["rendererEGLPath"].endswith("librust_gl.so"):
-        raise SystemExit("rendererEGLPath must point at librust_gl.so (it re-exports EGL)")
+    if not config["rendererEGLPath"].endswith(LIBRARY_NAME):
+        raise SystemExit(f"rendererEGLPath must point at {LIBRARY_NAME} (it re-exports EGL)")
     # MobileGL, the plugin that runs in the widest set of launchers, resolves both
     # libraries through the **| prefix so the launcher never has to guess a path.
     if not config["rendererEGLPath"].startswith("**|"):
