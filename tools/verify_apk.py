@@ -104,12 +104,12 @@ def load_segment_alignments(blob: bytes):
         e_phoff = int.from_bytes(blob[0x20:0x28], "little")
         e_phentsize = int.from_bytes(blob[0x36:0x38], "little")
         e_phnum = int.from_bytes(blob[0x38:0x3A], "little")
-        layout = {"type": (0, 4), "offset": (8, 8), "align": (48, 8)}
+        layout = {"type": (0, 4), "offset": (8, 8), "vaddr": (16, 8), "align": (48, 8)}
     elif elf_class == 1:  # 32-bit
         e_phoff = int.from_bytes(blob[0x1C:0x20], "little")
         e_phentsize = int.from_bytes(blob[0x2A:0x2C], "little")
         e_phnum = int.from_bytes(blob[0x2C:0x2E], "little")
-        layout = {"type": (0, 4), "offset": (4, 4), "align": (28, 4)}
+        layout = {"type": (0, 4), "offset": (4, 4), "vaddr": (8, 4), "align": (28, 4)}
     else:
         return []
 
@@ -125,7 +125,7 @@ def load_segment_alignments(blob: bytes):
             break
         if field(header, "type") != PT_LOAD:
             continue
-        segments.append((field(header, "align"), field(header, "offset")))
+        segments.append((field(header, "align"), field(header, "offset"), field(header, "vaddr")))
     return segments
 
 
@@ -133,16 +133,19 @@ def check_page_alignment(entry: str, blob: bytes) -> None:
     segments = load_segment_alignments(blob)
     if not segments:
         raise SystemExit(f"{entry} has no PT_LOAD segments to check")
-    for align, offset in segments:
+    table = ", ".join(
+        f"[align 0x{align:x} offset 0x{offset:x} vaddr 0x{vaddr:x}]" for align, offset, vaddr in segments
+    )
+    for align, offset, _vaddr in segments:
         if align < PAGE_16K:
             raise SystemExit(
-                f"{entry}: a PT_LOAD segment is aligned to {align} bytes, not 16 KB - "
-                "this library cannot load on an Android 15+ 16 KB-page device"
+                f"{entry}: a PT_LOAD segment is aligned to 0x{align:x}, not 16 KB - this "
+                "library cannot load on an Android 15+ 16 KB-page device. Segments: " + table
             )
         if offset % PAGE_16K != 0:
             raise SystemExit(
-                f"{entry}: a PT_LOAD segment starts at file offset {offset}, which is "
-                "not a multiple of 16 KB - the installer will reject it"
+                f"{entry}: a PT_LOAD segment starts at file offset 0x{offset:x}, which is "
+                "not a multiple of 16 KB - the installer will reject it. Segments: " + table
             )
 
 

@@ -108,7 +108,7 @@ class ManifestTests(unittest.TestCase):
     def test_16kb_page_alignment_is_detected_either_way(self):
         """A synthetic ELF: one PT_LOAD, 64-bit then 32-bit, aligned and misaligned."""
 
-        def elf(elf_class, page_align, offset):
+        def elf(elf_class, page_align, offset, vaddr=0x10000):
             header_size = 0x40 if elf_class == 2 else 0x34
             phentsize = 0x38 if elf_class == 2 else 0x20
             blob = bytearray(header_size + phentsize)
@@ -121,6 +121,7 @@ class ManifestTests(unittest.TestCase):
                 ph = header_size
                 blob[ph:ph + 4] = (1).to_bytes(4, "little")            # PT_LOAD
                 blob[ph + 8:ph + 16] = offset.to_bytes(8, "little")    # p_offset
+                blob[ph + 16:ph + 24] = vaddr.to_bytes(8, "little")    # p_vaddr
                 blob[ph + 48:ph + 56] = page_align.to_bytes(8, "little")  # p_align
             else:
                 blob[0x1C:0x20] = header_size.to_bytes(4, "little")
@@ -129,12 +130,14 @@ class ManifestTests(unittest.TestCase):
                 ph = header_size
                 blob[ph:ph + 4] = (1).to_bytes(4, "little")
                 blob[ph + 4:ph + 8] = offset.to_bytes(4, "little")
+                blob[ph + 8:ph + 12] = vaddr.to_bytes(4, "little")
                 blob[ph + 28:ph + 32] = page_align.to_bytes(4, "little")
             return bytes(blob)
 
         for elf_class in (2, 1):
             good = elf(elf_class, 16384, 16384)
-            self.assertEqual(verify_apk.load_segment_alignments(good), [(16384, 16384)])
+            self.assertEqual(verify_apk.load_segment_alignments(good),
+                             [(16384, 16384, 0x10000)])
             verify_apk.check_page_alignment("good.so", good)
             with self.assertRaises(SystemExit):
                 verify_apk.check_page_alignment("small.so", elf(elf_class, 4096, 4096))
