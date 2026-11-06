@@ -150,9 +150,11 @@ jobs:
           reasons = [line for line in text.splitlines()
                      if line.startswith(("Traceback", "SystemExit", "subprocess.CalledProcessError"))
                      or ": error:" in line or line.startswith("  File ")]
-          shown = "\n".join(dict.fromkeys(reasons + text.splitlines()[-25:]))
+          # Reasons first, then a short tail: the annotation is capped at 3000
+          # characters, so keeping the end of the message is what cut the reason off.
+          shown = "\n".join(dict.fromkeys(reasons + text.splitlines()[-8:]))
           esc = shown.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-          print("::error title=RustGL plugin packaging failed::" + esc[-3000:])
+          print("::error title=RustGL plugin packaging failed::" + esc[:3000])
           PY
       - name: Upload the packaging log when it fails
         if: failure()
