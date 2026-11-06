@@ -60,6 +60,14 @@ TITLES = {
     "rustgl_framestats_title": "Log frame-time percentiles (p50/p95/p99, log only)",
 }
 
+# Launchers look for this renderer under two names: the one it is built as, and the
+# spelling without the underscore, which some of them derive from the plugin's display
+# name and then fail on with "librustgl.so missing". Both are the same library, and an APK
+# cannot carry a working symlink, so each ABI ships a copy under each name. That costs the
+# size of the library again per ABI; it is cheaper than a renderer that will not load.
+LIBRARY_NAME = "librust_gl.so"
+LIBRARY_ALIASES = ("librust_gl.so", "librustgl.so")
+
 PACKAGE_NAME = "np.com.gurkha.rustgl.plugin"
 APP_LABEL = "RustGL (Gurkha build)"
 BUILD_METADATA_NAME = "build-info.json"
@@ -221,7 +229,8 @@ def write_local_import(target: Path, build_info: dict) -> None:
     with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("config", (len(payload)).to_bytes(2, "big") + payload)
         for abi, info in build_info["libraries"].items():
-            archive.write(info["path"], f"libs/{abi}/librust_gl.so")
+            for name in LIBRARY_ALIASES:
+                archive.write(info["path"], f"libs/{abi}/{name}")
         archive.writestr("README.txt", (DOCS / "UNIVERSAL_APK.md").read_text(encoding="utf-8"))
 
 
@@ -230,14 +239,16 @@ def write_abi_zips(output: Path, build_info: dict) -> None:
         target = output / f"rustgl-gurkha-{abi}.zip"
         metadata = {
             "abi": abi,
-            "library": "librust_gl.so",
+            "library": LIBRARY_NAME,
+            "aliases": list(LIBRARY_ALIASES),
             "sha256": info["sha256"],
             "size": info["size"],
             "version": build_info["versionName"],
             "source": build_info.get("source"),
         }
         with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
-            archive.write(info["path"], "librust_gl.so")
+            for name in LIBRARY_ALIASES:
+                archive.write(info["path"], name)
             archive.writestr("build.json", json.dumps(metadata, indent=2) + "\n")
             archive.writestr("README.txt", (DOCS / "UNIVERSAL_APK.md").read_text(encoding="utf-8"))
             if (ROOT / "NOTICE").exists():
@@ -254,7 +265,8 @@ def prepare_assets(staging: Path, build_info: dict, config_json: str) -> None:
         shutil.copy2(ROOT / "NOTICE", assets / "NOTICE")
     for abi in ABIS:
         (staging / "lib" / abi).mkdir(parents=True, exist_ok=True)
-        shutil.copy2(build_info["libraries"][abi]["path"], staging / "lib" / abi / "librust_gl.so")
+        for name in LIBRARY_ALIASES:
+            shutil.copy2(build_info["libraries"][abi]["path"], staging / "lib" / abi / name)
 
 
 def keystore(tmp: Path):

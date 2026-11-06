@@ -52,6 +52,22 @@ Requirements: **Android 8.0 (API 26) or newer** and real **OpenGL ES 3**
 support. Android picks the ABI of the *launcher process*, not of the CPU: a
 32-bit launcher on a 64-bit phone uses the armeabi-v7a build.
 
+## Library names
+
+Every ABI in the APK carries the renderer **twice**, as identical copies:
+
+* `lib/<abi>/librust_gl.so` - the name it is built as, and the one the plugin's own
+  configuration points at.
+* `lib/<abi>/librustgl.so` - the same library under the spelling some launchers ask
+  for. Those launchers derive the library name from the plugin's display name rather
+  than reading `rendererGLPath`, and they fail with "librustgl.so missing" when it is
+  not there.
+
+An APK cannot carry a working symlink, so the second name is a real copy: the APK
+grows by roughly the size of the library again, per ABI. `tools/verify_apk.py` checks
+that both entries exist and that their bytes are identical, so the two names can never
+drift apart.
+
 ## What the renderer is
 
 RustGL is a compatibility layer, not a driver. Minecraft talks desktop OpenGL to

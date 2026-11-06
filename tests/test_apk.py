@@ -105,6 +105,15 @@ class ManifestTests(unittest.TestCase):
         self.assertTrue(egl_name.startswith("/"))
         self.assertEqual(egl_name.lstrip("/"), "librust_gl.so")
 
+    def test_every_abi_ships_the_library_under_both_names(self):
+        # Some launchers ask for librustgl.so - the name without the underscore - and
+        # crash with "librustgl.so missing" when only librust_gl.so is there.
+        self.assertIn("librust_gl.so", package_apk.LIBRARY_ALIASES)
+        self.assertIn("librustgl.so", package_apk.LIBRARY_ALIASES)
+        doc = (ROOT / "docs" / "UNIVERSAL_APK.md").read_text(encoding="utf-8")
+        self.assertIn("librustgl.so", doc,
+                      "the second library name is documented, or nobody will know why it ships")
+
     def test_v1_environment_is_parseable(self):
         for key in ("pojavEnv", "boatEnv", "h2co3Env"):
             entries = meta_data()[key].split(":")
