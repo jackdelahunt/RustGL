@@ -145,8 +145,14 @@ jobs:
           import pathlib, sys
           path = pathlib.Path(sys.argv[1])
           text = path.read_text(errors="replace") if path.exists() else "Packaging log missing"
-          text = text[-3000:].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-          print("::error title=RustGL plugin packaging failed::" + text)
+          # The tail of the log is mostly aapt2 noise; the reason for the failure is
+          # whichever line says what went wrong, so print those before the tail.
+          reasons = [line for line in text.splitlines()
+                     if line.startswith(("Traceback", "SystemExit", "subprocess.CalledProcessError"))
+                     or ": error:" in line or line.startswith("  File ")]
+          shown = "\n".join(dict.fromkeys(reasons + text.splitlines()[-25:]))
+          esc = shown.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          print("::error title=RustGL plugin packaging failed::" + esc[-3000:])
           PY
       - name: Upload the packaging log when it fails
         if: failure()

@@ -271,9 +271,10 @@ def check_manifest(aapt2: Path, apk: Path) -> dict:
     if renderer_id != "opengles3":
         raise SystemExit(f"unexpected v1 renderer id {renderer_id!r}: launchers derive "
                          "context hints from it, so it must be the id they know")
-    if gl_name != "librust_gl.so":
-        raise SystemExit(f"unexpected v1 GL library {gl_name!r}")
-    if not egl_name.startswith("/") and egl_name != "librust_gl.so":
+    # The name here has to be the one launchers load, which is what ships.
+    if gl_name != LIBRARY_NAME:
+        raise SystemExit(f"unexpected v1 GL library {gl_name!r}, expected {LIBRARY_NAME}")
+    if not egl_name.startswith("/") and egl_name.lstrip("/") != LIBRARY_NAME:
         raise SystemExit(f"v1 EGL library {egl_name!r} cannot be resolved by a launcher")
 
     for key in ("pojavEnv", "boatEnv", "h2co3Env"):
