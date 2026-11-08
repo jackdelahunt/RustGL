@@ -1,0 +1,4954 @@
+//! C-ABI OpenGL surface loaded by the launcher as the "GL library".
+//!
+//! GLES 3.0 passthrough with desktop-GL compatibility shims:
+//! - shader source rewriting (desktop GLSL → GLSL ES)
+//! - BGRA upload swizzle, clamp-to-border → clamp-to-edge
+//! - glMapBuffer → glMapBufferRange, glDrawBuffer → glDrawBuffers, glClearDepth → f
+//! - GL 4.5 core compatibility surface and shader translation
+//!
+//! This is still incomplete for full Minecraft parity (no Vulkan, limited shader rewrite,
+//! missing some desktop-only APIs). Expect crash/black-screen on unhandled paths.
+
+#[macro_use]
+// Entry points are grouped by API family -- the desktop-GL compatibility surface, the ES
+// surface underneath it, and extension spellings. See `gl/mod.rs` for the full map.
+mod gl;
+mod gles3;
+mod khr;
+
+// The GL compatibility surface, still flat: vertex/attribute association and MSAA
+// substitution, the GL 4.5 named-object entry points, and the fixed-function path.
+mod vertex_state;
+mod named_objects;
+mod fixed_func;
+mod fixed_draw;
+mod immediate;
+mod overlay;
+
+use renderer_core::{Backend, BackendKind, Config, GlErrorState};
+use std::ffi::{c_char, c_void, CStr, CString};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Mutex, OnceLock, RwLock};
+use std::collections::HashMap;
+use std::time::Instant;
+
+
+const GL_INVALID_VALUE: u32 = 0x0501;
+const GL_INVALID_OPERATION: u32 = 0x0502;
+const GL_DRAW_BUFFER: u32 = 0x0C01;
+const GL_DRAW_BUFFER0: u32 = 0x8825;
+const GL_DRAW_FRAMEBUFFER_BINDING: u32 = 0x8CA6;
+const GL_READ_FRAMEBUFFER_BINDING: u32 = 0x8CAA;
+const GL_FRONT_LEFT: u32 = 0x0400;
+const GL_BACK_LEFT: u32 = 0x0402;
+const GL_BACK: u32 = 0x0405;
+const GL_FRONT: u32 = 0x0404;
+const GL_FRONT_AND_BACK: u32 = 0x0408;
+static SHADER_SOURCE_CACHE: Mutex<Vec<(u32, String)>> = Mutex::new(Vec::new());
+static COMPILE_FAILURES_LOGGED: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+static LINK_FAILURES_LOGGED: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+fn log_failure_once(seen: &Mutex<Vec<u32>>, object: u32) -> bool {
+    let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.contains(&object) {
+        false
+    } else {
+        seen.push(object);
+        true
+    }
+}
+
+fn clear_logged_failure(seen: &Mutex<Vec<u32>>, object: u32) {
+    seen.lock().unwrap_or_else(|e| e.into_inner()).retain(|id| *id != object);
+}
+
+fn remember_shader_source(shader: u32, source: String) {
+    let mut cache = SHADER_SOURCE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, old_source)) = cache.iter_mut().find(|(id, _)| *id == shader) {
+        *old_source = source;
+    } else {
+        cache.push((shader, source));
+    }
+    if cache.len() > 32 {
+        cache.remove(0);
+    }
+}
+
+fn take_shader_source(shader: u32) -> Option<String> {
+    let mut cache = SHADER_SOURCE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    cache.iter().position(|(id, _)| *id == shader).map(|index| cache.remove(index).1)
+}
+
+/// Parses the first `<string>:<line>:` location out of a driver info log (`0:15: S0001: ...`).
+fn shader_error_location(info_log: &str) -> Option<(usize, usize)> {
+    info_log.lines().find_map(|line| {
+        let (string, rest) = line.split_once(':')?;
+        let string: usize = string.trim().parse().ok()?;
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        Some((string, digits.parse().ok()?))
+    })
+}
+
+/// Maps a driver-reported `<string>:<line>` back to a 1-based physical line of `source`.
+///
+/// Mojang's import processor (and Iris) emit `#line N S` around every `#moj_import`, so the
+/// driver numbers lines relative to those directives, not to the translated text. Taking the
+/// reported number as a physical index shows the wrong excerpt: a failure at `0:15` of the
+/// main file, after a 30-line import, sits on physical line ~58, not 15.
+fn physical_line_for_error(source: &str, string: usize, line: usize) -> Option<usize> {
+    let (mut cur_string, mut cur_line) = (0usize, 1usize);
+    for (index, text) in source.lines().enumerate() {
+        let t = text.trim_start();
+        if let Some(rest) = t.strip_prefix("#line") {
+            let mut parts = rest.split_whitespace();
+            if let Some(n) = parts.next().and_then(|n| n.parse::<usize>().ok()) {
+                cur_line = n;
+                if let Some(s) = parts.next().and_then(|s| s.parse::<usize>().ok()) {
+                    cur_string = s;
+                }
+                continue;
+            }
+        }
+        if cur_string == string && cur_line == line {
+            return Some(index + 1);
+        }
+        cur_line += 1;
+    }
+    None
+}
+
+fn shader_error_line(info_log: &str) -> Option<usize> {
+    shader_error_location(info_log).map(|(_, line)| line)
+}
+
+
+static BACKEND: OnceLock<Box<dyn Backend>> = OnceLock::new();
+static ERRORS: OnceLock<GlErrorState> = OnceLock::new();
+static INIT_LOCK: Mutex<()> = Mutex::new(());
+
+fn errors() -> &'static GlErrorState {
+    ERRORS.get_or_init(GlErrorState::default)
+}
+
+/// Current GL_ARRAY_BUFFER binding (client-array pointers capture it, per GL semantics).
+/// Shadow of the `GL_ARRAY_BUFFER` binding.
+///
+/// `GL_ARRAY_BUFFER` is global context state (it is *not* part of vertex-array-object
+/// state, unlike `GL_ELEMENT_ARRAY_BUFFER`), so mirroring it here is safe. This removes a
+/// `glGetIntegerv` round-trip from every client-array pointer call on the fixed-function
+/// path.
+static ARRAY_BUFFER_BINDING: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn set_array_buffer_binding(v: u32) {
+    ARRAY_BUFFER_BINDING.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn current_array_buffer() -> u32 {
+    ARRAY_BUFFER_BINDING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+
+/// Ring buffer of the most recent forwarded GL entry points.
+///
+/// The 1.21.11 failure was `IllegalStateException: OpenGL error 1282` with no "GL error site"
+/// line, which proved the error came from the *driver*, not from this layer -- and left no way
+/// to tell which call provoked it. Minecraft only ever reports the numeric code, so the bridge
+/// keeps the last few calls and dumps them when `glGetError` returns something.
+///
+/// Enabled with `RENDERER_TRACE_GL=1` so the common path stays a single relaxed atomic load.
+const TRACE_LEN: usize = 16;
+/// Entries kept when tracing. A test asserting a translation needs the whole sequence, not a
+/// ring of the last few, so `RENDERER_TRACE_GL=all` keeps everything up to this cap.
+const TRACE_MAX: usize = 4096;
+static TRACE: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static TRACE_ON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
+
+fn trace_enabled() -> bool {
+    let cached = TRACE_ON.load(Ordering::Relaxed);
+    if cached != u8::MAX {
+        return cached != 0;
+    }
+    let on = match std::env::var("RENDERER_TRACE_GL").as_deref() {
+        Ok("1") => 1,
+        Ok("all") => 2,
+        _ => 0,
+    };
+    TRACE_ON.store(on, Ordering::Relaxed);
+    on != 0
+}
+
+/// Records a forwarded GL call. Called from `forward_all!`, so it covers every pass-through.
+#[inline]
+pub(crate) fn trace_call(name: &str) {
+    let mut mode = TRACE_ON.load(Ordering::Relaxed);
+    if mode == u8::MAX {
+        trace_enabled();
+        mode = TRACE_ON.load(Ordering::Relaxed);
+    }
+    if mode == 0 {
+        return;
+    }
+    let mut t = TRACE.lock().unwrap_or_else(|e| e.into_inner());
+    if mode == 2 {
+        if t.len() < TRACE_MAX {
+            t.push(name.to_string());
+        }
+    } else {
+        if t.len() == TRACE_LEN {
+            t.remove(0);
+        }
+        t.push(name.to_string());
+    }
+}
+
+/// Records a translation decision -- what a desktop GL call was rewritten into -- so a test can
+/// assert the rewrite rather than inferring it from pixels.
+pub(crate) fn trace_translation(what: &str) {
+    trace_call(what);
+}
+
+/// Introspection for the harness: clears the trace, reports its length, and returns entry `i`.
+/// Whether a resolved pointer is the shared no-op stub. The harness uses this to prove that
+/// names the layer exports resolve to their implementations rather than to nothing.
+#[no_mangle]
+pub extern "C" fn glcompat_is_stub(ptr: *const c_void) -> i32 {
+    i32::from(ptr == legacy_noop_fn as *const c_void)
+}
+
+#[no_mangle]
+pub extern "C" fn glcompat_trace_reset() {
+    TRACE.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+#[no_mangle]
+pub extern "C" fn glcompat_trace_len() -> u32 {
+    TRACE.lock().unwrap_or_else(|e| e.into_inner()).len() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn glcompat_trace_at(i: u32) -> *const u8 {
+    let t = TRACE.lock().unwrap_or_else(|e| e.into_inner());
+    match t.get(i as usize) {
+        Some(s) => s.as_ptr(),
+        None => std::ptr::null(),
+    }
+}
+
+/// Dumps the recent call history, newest last. Called when the game sees a GL error.
+fn dump_trace(reason: &str) {
+    if !trace_enabled() {
+        return;
+    }
+    let t = TRACE.lock().unwrap_or_else(|e| e.into_inner());
+    if t.is_empty() {
+        return;
+    }
+    log(&format!("[GLTrace] {reason}; calls: {}", t.join(" -> ")));
+}
+
+/// Runs `f` only the first time it is called. Used for one-time diagnostics that would
+/// otherwise repeat per frame.
+pub(crate) fn log_once(flag: &std::sync::atomic::AtomicBool, msg: &str) {
+    if !flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        log(msg);
+    }
+}
+
+fn log(msg: &str) {
+    #[cfg(target_os = "android")]
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            android_logger::init_once(
+                android_logger::Config::default()
+                    .with_tag("RustRenderer")
+                    .with_max_level(log::LevelFilter::Info),
+            )
+        });
+        log::info!("{msg}");
+        // Also to stderr: the launcher captures it into the game log (no adb needed).
+        eprintln!("[RustRenderer] {msg}");
+    }
+    #[cfg(not(target_os = "android"))]
+    eprintln!("[RustRenderer] {msg}");
+}
+
+/// Lazily selects/initializes a backend on the first GL call (a context must be current by
+/// then). Never selects a backend that fails to initialize.
+static BACKEND_FAILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn backend() -> Option<&'static dyn Backend> {
+    if let Some(b) = BACKEND.get() {
+        return Some(b.as_ref());
+    }
+    // A failed initialisation is remembered too. Without this the whole probe reran on every
+    // GL call, which during a trace replay was 51972 attempts and buried every other message.
+    if BACKEND_FAILED.load(Ordering::Relaxed) {
+        return None;
+    }
+    let _g = INIT_LOCK.lock().ok()?;
+    if let Some(b) = BACKEND.get() {
+        return Some(b.as_ref());
+    }
+    let cfg = Config::from_env();
+    log(&format!(
+        "[Renderer] Initializing, requested backend: {}",
+        cfg.backend.as_str()
+    ));
+    if !cfg.display.is_empty() {
+        log(&format!("[Renderer] Display: {}", cfg.display));
+    }
+    if !cfg.angle_backend.is_empty() {
+        log(&format!("[Renderer] ANGLE backend: {}", cfg.angle_backend));
+    }
+    if !cfg.angle_renderer.is_empty() {
+        log(&format!("[Renderer] ANGLE renderer: {}", cfg.angle_renderer));
+    }
+    if cfg.debug {
+        log("[Renderer] Debug overlay enabled");
+    }
+
+    let gles = || match backend::GlesBackend::new() {
+        Ok(b) => Some(Box::new(b) as Box<dyn Backend>),
+        Err(e) => {
+            log(&format!("[GLES] {e}"));
+            None
+        }
+    };
+
+    // Vulkan is only *attempted* for the modes that ask for it. Note the game reaches us
+    // through desktop GL entry points, which the GLES driver serves; a Vulkan backend is
+    // usable here only for renderer-owned work (fixed-function emulation), and only when it
+    // reports it can actually render.
+    let wants_vulkan = matches!(
+        cfg.backend,
+        BackendKind::Auto | BackendKind::Vulkan | BackendKind::Hybrid
+    );
+    let probed = if wants_vulkan {
+        match backend::probe_vulkan() {
+            Ok(b) => {
+                let i = b.device_info();
+                log(&format!("[Vulkan] found {} — {}", i.renderer, i.api_version));
+                if !b.can_render() {
+                    log("[Vulkan] device present but it cannot render yet (no SPIR-V/pipeline/present path)");
+                }
+                Some(b)
+            }
+            Err(e) => {
+                log(&format!("[Vulkan] {e}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // Description for logging, taken before the backend is moved into a match arm.
+    let detected_vulkan = probed.as_ref().map(|b| b.device_info().renderer.clone());
+    let vulkan_can_render = probed.as_ref().is_some_and(|b| b.can_render());
+
+    let chosen: Option<Box<dyn Backend>> = match cfg.backend {
+        // Explicit Vulkan: never claim to be rendering on a backend that cannot.
+        BackendKind::Vulkan => match probed {
+            Some(b) if vulkan_can_render => Some(b),
+            _ => {
+                log("[Renderer] RENDERER_BACKEND=vulkan requested but no Vulkan device can render; using GLES so the game still starts");
+                gles()
+            }
+        },
+        // Hybrid: GLES serves the GL entry points that every frame is drawn through; Vulkan
+        // is kept for renderer-owned work once it can render. Today it cannot, so GLES draws
+        // the frame and this says so explicitly rather than looking like gles was ignored.
+        BackendKind::Hybrid => {
+            match (&detected_vulkan, vulkan_can_render) {
+                (Some(dev), true) => log(&format!(
+                    "[Renderer] hybrid: Vulkan device '{dev}' will take renderer-owned work; \
+                     GLES still serves the GL entry points"
+                )),
+                (Some(dev), false) => log(&format!(
+                    "[Renderer] hybrid: Vulkan device '{dev}' detected but it cannot render yet, \
+                     so GLES serves the whole frame. Vulkan is used for device reporting only."
+                )),
+                (None, _) => log(
+                    "[Renderer] hybrid: no Vulkan device available, so GLES serves the whole frame",
+                ),
+            }
+            gles()
+        }
+        BackendKind::Gles => gles(),
+        BackendKind::Auto => {
+            if vulkan_can_render {
+                probed
+            } else {
+                gles()
+            }
+        }
+    };
+
+    match chosen {
+        Some(b) => {
+            let i = b.device_info();
+            log(&format!("[Renderer] Backend: {}", b.kind().as_str()));
+            log(&format!("[Renderer] GPU: {} ({})", i.renderer, i.vendor));
+            log(&format!("[Renderer] API: {}", i.api_version));
+            let c = b.capabilities();
+            log(&format!(
+                "[Renderer] GlesCapabilities: ES {}.{}, {} extensions, max texture {}, {} draw buffers",
+                c.es_major, c.es_minor, c.extensions.len(), c.max_texture_size, c.max_draw_buffers
+            ));
+            let _ = BACKEND.set(b);
+            let cfg = Config::from_env();
+            overlay::set_enabled(cfg.debug);
+            BACKEND.get().map(|b| b.as_ref())
+        }
+        None => {
+            BACKEND_FAILED.store(true, Ordering::Relaxed);
+            log("[Renderer] No backend could be initialized; the bridge will run in passthrough-only mode");
+            None
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn glGetError() -> u32 {
+    let ours = errors().take();
+    if ours != 0 {
+        dump_trace(&format!("glGetError from this layer: 0x{ours:04X}"));
+        return ours;
+    }
+    if let Some(b) = backend() {
+        let e = b.get_error();
+        if e != 0 {
+            dump_trace(&format!("glGetError from the driver: 0x{e:04X}"));
+        }
+        return e;
+    }
+    unsafe {
+        type F = unsafe extern "C" fn() -> u32;
+        if let Some(f) = driver_fn_cached::<F>("glGetError") {
+            let e = f();
+            if e != 0 {
+                dump_trace(&format!("glGetError from the driver: 0x{e:04X}"));
+            }
+            return e;
+        }
+    }
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn glClearColor(r: f32, g: f32, b: f32, a: f32) {
+    if let Some(be) = backend() {
+        be.clear_color(r, g, b, a);
+        return;
+    }
+    unsafe {
+        type F = unsafe extern "C" fn(f32, f32, f32, f32);
+        if let Some(f) = driver_fn_cached::<F>("glClearColor") {
+            f(r, g, b, a);
+            return;
+        }
+    }
+    errors().set(GL_INVALID_OPERATION);
+}
+
+#[no_mangle]
+pub extern "C" fn glClear(mask: u32) {
+    if let Some(be) = backend() {
+        be.clear(mask);
+        return;
+    }
+    unsafe {
+        type F = unsafe extern "C" fn(u32);
+        if let Some(f) = driver_fn_cached::<F>("glClear") {
+            f(mask);
+            return;
+        }
+    }
+    errors().set(GL_INVALID_OPERATION);
+}
+
+#[no_mangle]
+pub extern "C" fn glViewport(x: i32, y: i32, w: i32, h: i32) {
+    if w < 0 || h < 0 {
+        errors().set(GL_INVALID_VALUE);
+        return;
+    }
+    if let Some(be) = backend() {
+        be.viewport(x, y, w, h);
+        return;
+    }
+    unsafe {
+        type F = unsafe extern "C" fn(i32, i32, i32, i32);
+        if let Some(f) = driver_fn_cached::<F>("glViewport") {
+            f(x, y, w, h);
+            return;
+        }
+    }
+    errors().set(GL_INVALID_OPERATION);
+}
+
+#[no_mangle]
+pub extern "C" fn glEnable(cap: u32) {
+    if fixed_func::handle_cap(cap, true) {
+        return;
+    }
+    if let Some(be) = backend() {
+        be.enable(cap);
+        return;
+    }
+    unsafe {
+        type F = unsafe extern "C" fn(u32);
+        if let Some(f) = driver_fn_cached::<F>("glEnable") {
+            f(cap);
+            return;
+        }
+    }
+    errors().set(GL_INVALID_OPERATION);
+}
+
+#[no_mangle]
+pub extern "C" fn glDisable(cap: u32) {
+    if fixed_func::handle_cap(cap, false) {
+        return;
+    }
+    if let Some(be) = backend() {
+        be.disable(cap);
+        return;
+    }
+    unsafe {
+        type F = unsafe extern "C" fn(u32);
+        if let Some(f) = driver_fn_cached::<F>("glDisable") {
+            f(cap);
+            return;
+        }
+    }
+    errors().set(GL_INVALID_OPERATION);
+}
+
+const GL_VERSION: u32 = 0x1F02;
+const GL_SHADING_LANGUAGE_VERSION: u32 = 0x8B8C;
+const GL_MAJOR_VERSION: u32 = 0x821B;
+const GL_MINOR_VERSION: u32 = 0x821C;
+pub(crate) const GL_VERTEX_ARRAY_BINDING: u32 = 0x85B5;
+
+/// The widest claim the layer ever makes, and the one an OpenGL ES 3.2 driver underneath
+/// can actually back.
+static SPOOF_VERSION: &[u8] = b"4.5 (Core Profile) RustGL\0";
+static SPOOF_GLSL: &[u8] = b"4.50\0";
+
+/// Whether the layer reports a compatibility version at all. Always on - it is the number
+/// it reports that varies, see [`claimed_version`].
+fn spoof_gl() -> bool {
+    true
+}
+
+/// The version this layer claims, as `(major, minor, GL_VERSION, GL_SHADING_LANGUAGE_VERSION)`.
+///
+/// It follows the driver underneath instead of being a constant:
+///
+/// | the driver really is | claim | why |
+/// |---|---|---|
+/// | OpenGL ES 3.2 | GL 4.5 / GLSL 4.50 | ES 3.2 backs everything this layer emulates |
+/// | OpenGL ES 3.1 | GL 4.3 / GLSL 4.30 | compute, image load/store and indirect draws are the 4.3 tier |
+/// | OpenGL ES 3.0 | GL 3.3 / GLSL 3.30 | no compute, no image load/store, no indirect draws |
+/// | anything older | GL 2.1 / GLSL 1.20 | only the fixed-function path can be honoured |
+///
+/// Claiming 4.5 unconditionally is what this did before, and it is an ES 3.0 or ES 3.1
+/// driver that pays for it: the game asks for compute shaders, image load/store or
+/// indirect draws the driver cannot do, and what comes back is a program that will not
+/// build, or an entry point that is not there. Older Mali parts are exactly those drivers,
+/// which is how the same build can work on an Adreno and fail on a Mali.
+fn claimed_version() -> (i32, i32, &'static [u8], &'static [u8]) {
+    // Escape hatch for triage: RENDERER_GL_VERSION=33 or 43 forces a lower claim without
+    // a rebuild, which is how you find out whether a game that reports a failed OpenGL
+    // path is objecting to the version or to something underneath it.
+    if let Ok(forced) = std::env::var("RENDERER_GL_VERSION") {
+        let claim = match forced.as_str() {
+            "45" | "4.5" => Some((4, 5, b"4.5 (Core Profile) RustGL\0".as_slice(), b"4.50\0".as_slice())),
+            "43" | "4.3" => Some((4, 3, b"4.3 (Core Profile) RustGL\0".as_slice(), b"4.30\0".as_slice())),
+            "33" | "3.3" => Some((3, 3, b"3.3 (Core Profile) RustGL\0".as_slice(), b"3.30\0".as_slice())),
+            _ => None,
+        };
+        if let Some(claim) = claim {
+            static FORCED_ONCE: OnceLock<()> = OnceLock::new();
+            if FORCED_ONCE.set(()).is_ok() {
+                log(&format!(
+                    "[GLCompat] RENDERER_GL_VERSION={forced}: claiming GL {}.{} regardless of the driver",
+                    claim.0, claim.1
+                ));
+            }
+            return claim;
+        }
+    }
+    let caps = gles3::caps();
+    if !caps.valid {
+        // Nothing has been measured yet - no context has been current. Guessing downwards
+        // would understate a driver that is about to report 3.2, so keep the widest claim.
+        return (4, 5, SPOOF_VERSION, SPOOF_GLSL);
+    }
+    let claim = match (caps.es_major, caps.es_minor) {
+        (major, minor) if (major, minor) >= (3, 2) => {
+            (4, 5, b"4.5 (Core Profile) RustGL\0".as_slice(), b"4.50\0".as_slice())
+        }
+        (3, 1) => (4, 3, b"4.3 (Core Profile) RustGL\0".as_slice(), b"4.30\0".as_slice()),
+        (3, _) => (3, 3, b"3.3 (Core Profile) RustGL\0".as_slice(), b"3.30\0".as_slice()),
+        _ => (2, 1, b"2.1 RustGL\0".as_slice(), b"1.20\0".as_slice()),
+    };
+    static CLAIMED_ONCE: OnceLock<()> = OnceLock::new();
+    if CLAIMED_ONCE.set(()).is_ok() {
+        log(&format!(
+            "[GLCompat] driver is OpenGL ES {}.{} ({}); claiming GL {}.{} / GLSL {}",
+            caps.es_major, caps.es_minor, caps.device_description, claim.0, claim.1,
+            String::from_utf8_lossy(claim.3.strip_suffix(&[0u8]).unwrap_or(claim.3))
+        ));
+    }
+    claim
+}
+
+/// Resolves a driver function pointer of type `T` (must be a fn pointer type).
+/// Direct GLESv3/v2 symbol bridge used by every forwarded entry point.
+/// Symbol lookup does NOT require a current context (only the first real GL *call*
+/// that queries state does). This is what LWJGL needs: dlsym our exports, then
+/// each export jumps into the system GLES driver.
+struct GlesDriver {
+    lib: libloading::Library,
+}
+
+fn gles_driver() -> Option<&'static GlesDriver> {
+    static DRV: OnceLock<Option<GlesDriver>> = OnceLock::new();
+    DRV.get_or_init(|| {
+        // Prefer GLESv3; fall back to GLESv2 (still exports most ES3 entry points
+        // on modern Android drivers via eglGetProcAddress, but many core symbols
+        // are in the GLESv3 soname).
+        let candidates = [
+            "libGLESv3.so",
+            "/system/lib64/libGLESv3.so",
+            "/system/lib/libGLESv3.so",
+            "/vendor/lib64/libGLESv3.so",
+            "/vendor/lib/libGLESv3.so",
+            "libGLESv2.so",
+            "/system/lib64/libGLESv2.so",
+            "/system/lib/libGLESv2.so",
+        ];
+        for path in candidates {
+            match unsafe { libloading::Library::new(path) } {
+                Ok(lib) => {
+                    log(&format!("[GLBridge] loaded GLES driver: {path}"));
+                    return Some(GlesDriver { lib });
+                }
+                Err(e) => log(&format!("[GLBridge] {path}: {e}")),
+            }
+        }
+        log("[GLBridge] FAILED to load any GLESv3/v2 library");
+        None
+    })
+    .as_ref()
+}
+
+/// Whether the current driver context is OpenGL ES, which decides whether desktop GLSL is
+/// rewritten to GLSL ES 3.00 or to desktop GLSL targeting GL 4.5 core (GLSL 4.50).
+///
+/// Probed once from the real driver's `GL_VERSION` string (never the spoofed one): ES
+/// drivers report "OpenGL ES 3.x ...", desktop drivers report "<major>.<minor> (Core
+/// Profile) ...". Cached for the lifetime of the process — the shader target is tied to the
+/// driver library, not to individual contexts.
+static SHADER_TRANSLATION_IS_ES: OnceLock<bool> = OnceLock::new();
+
+/// True when shaders must be rewritten to GLSL ES 3.00 (GLES driver); false when they can be
+/// compiled as desktop GLSL against a GL 4.5 core driver.
+pub(crate) fn shader_translation_is_es() -> bool {
+    // Optional explicit override (RENDERER_SHADER_TRANSLATION_TARGET=es|desktop_450),
+    // useful for testing the desktop path on an ES context and vice versa.
+    if let Ok(t) = std::env::var("RENDERER_SHADER_TRANSLATION_TARGET") {
+        return match t.as_str() {
+            "es" => true,
+            "desktop_440" | "desktop_450" => false,
+            other => {
+                log(&format!(
+                    "[GLBridge] unknown RENDERER_SHADER_TRANSLATION_TARGET={other:?}, ignoring"
+                ));
+                probe_shader_target_is_es()
+            }
+        };
+    }
+    *SHADER_TRANSLATION_IS_ES.get_or_init(probe_shader_target_is_es)
+}
+
+fn version_supports_vertex_attrib_binding(is_es: bool, major: i32, minor: i32) -> bool {
+    if is_es {
+        (major, minor) >= (3, 1)
+    } else {
+        (major, minor) >= (4, 3)
+    }
+}
+
+pub(crate) fn driver_supports_vertex_attrib_binding() -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let is_es = probe_shader_target_is_es();
+        let mut major = 0;
+        let mut minor = 0;
+        let Some(get) =
+            driver_fn_cached::<unsafe extern "C" fn(u32, *mut i32)>("glGetIntegerv")
+        else {
+            return false;
+        };
+        unsafe {
+            get(GL_MAJOR_VERSION, &mut major);
+            get(GL_MINOR_VERSION, &mut minor);
+        }
+        version_supports_vertex_attrib_binding(is_es, major, minor)
+    })
+}
+
+fn map_draw_buffer_query_pname(pname: u32, is_es: bool) -> u32 {
+    if is_es && pname == GL_DRAW_BUFFER {
+        GL_DRAW_BUFFER0
+    } else {
+        pname
+    }
+}
+
+pub(crate) fn remap_draw_buffer_query_pname(pname: u32) -> u32 {
+    map_draw_buffer_query_pname(pname, shader_translation_is_es())
+}
+
+fn needs_default_framebuffer_buffer_remap(mode: u32) -> bool {
+    matches!(mode, GL_FRONT | GL_FRONT_LEFT | GL_BACK_LEFT | GL_FRONT_AND_BACK)
+}
+
+fn map_default_framebuffer_buffer(mode: u32, is_es: bool, framebuffer: u32) -> u32 {
+    if is_es && framebuffer == 0 && needs_default_framebuffer_buffer_remap(mode) {
+        GL_BACK
+    } else {
+        mode
+    }
+}
+
+unsafe fn current_framebuffer_binding(pname: u32) -> Option<u32> {
+    let get = driver_fn_cached::<unsafe extern "C" fn(u32, *mut i32)>("glGetIntegerv")?;
+    let mut binding = 0;
+    get(pname, &mut binding);
+    Some(binding as u32)
+}
+
+unsafe fn remap_default_framebuffer_buffer(mode: u32, binding_pname: u32) -> u32 {
+    if !shader_translation_is_es() || !needs_default_framebuffer_buffer_remap(mode) {
+        return mode;
+    }
+    let Some(binding) = current_framebuffer_binding(binding_pname) else {
+        return mode;
+    };
+    map_default_framebuffer_buffer(mode, true, binding)
+}
+
+fn probe_shader_target_is_es() -> bool {
+    // Query the real driver, not the spoof: with `RENDERER_SPOOF_GL=1` GL_VERSION is
+    // always the desktop 4.5 string. A context must be current for `glGetString` to return
+    // anything useful, and shader compilation can only happen with one current.
+    unsafe {
+        type F = unsafe extern "C" fn(u32) -> *const u8;
+        if let Some(f) = driver_fn_cached::<F>("glGetString") {
+            let p = f(GL_VERSION);
+            if !p.is_null() {
+                let s = std::ffi::CStr::from_ptr(p as *const c_char).to_string_lossy();
+                return s.trim_start().starts_with("OpenGL ES");
+            }
+        }
+    }
+    // If the driver string can't be read, fall back to ES: the common Android path and the
+    // trace-replay desktop path both use an ES context even though they report the spoofed
+    // desktop version. A desktop-only build that somehow reaches here without a context
+    // would fail on the next shader compile anyway.
+    true
+}
+
+/// ES-vs-desktop driver detection used by the shader-translation router and its tests.
+pub(crate) fn probe_shader_target_is_es_for_test(version: &str) -> bool {
+    version.trim_start().starts_with("OpenGL ES")
+}
+
+/// Resolved driver entry points, keyed by the name's bytes.
+///
+/// Resolving costs a `dlsym` (plus a `CString` allocation in the `eglGetProcAddress`
+/// fallback) and the previous code paid that on *every* forwarded GL call — a `dlsym` per
+/// draw call. The whole table is dropped when the EGL context changes, because
+/// `eglGetProcAddress` may hand back context-specific pointers.
+///
+/// The table is a hash map rather than a linear scan: this runs on every forwarded GL call,
+/// and on low-end SoCs (the Cortex-A53 cores paired with PowerVR GE8300-class GPUs) the
+/// scan of a ~200-entry vec under the mutex cost more than the draw dispatch it guarded.
+/// Keyed by the name contents (not the literal's address): the same spelling can sit at two
+/// addresses in one binary (string constants are only merged in optimized builds), and a
+/// second entry for one name would defeat the point of the cache.
+/// (The map is wrapped in an Option because `HashMap::new` is not a const fn and this is a static.)
+type DriverCache = std::collections::HashMap<&'static [u8], usize>;
+static DRIVER_CACHE: RwLock<Option<DriverCache>> = RwLock::new(None);
+
+/// Drops every memoized driver entry point. Called when the GL context changes.
+fn clear_driver_cache() {
+    DRIVER_CACHE
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+}
+
+/// Memoized [`driver_fn`]. Callers pass the same `'static` name every time.
+pub(crate) fn driver_fn_cached<T: Copy>(name: &'static str) -> Option<T> {
+    trace_call(name);
+    let key = name.as_bytes();
+    {
+        // A *shared* read lock: this runs on every forwarded GL call, and Minecraft's
+        // chunk-build threads (Sodium, and the vanilla chunk uploader) issue GL calls
+        // concurrently with the render thread. With a Mutex every one of those calls
+        // serialised on one lock; RwLock lets the (overwhelmingly common) hit path run
+        // in parallel and only the first resolution of a name takes the write lock.
+        let guard = DRIVER_CACHE.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(cache) = guard.as_ref() {
+            if let Some(addr) = cache.get(key) {
+                if *addr == 0 {
+                    return None;
+                }
+                // SAFETY: the cached value came from `driver_fn`, which stores only pointers
+                // obtained from dlsym / eglGetProcAddress for this exact symbol name.
+                let addr = *addr;
+                return Some(unsafe { std::mem::transmute_copy::<usize, T>(&addr) });
+            }
+        }
+    }
+    // Resolve outside the lock: dlsym must not run while the cache is borrowed.
+    let resolved = unsafe { driver_fn::<T>(name) };
+    let Some(f) = resolved else {
+        // Do NOT cache a miss. `eglGetProcAddress` can legitimately return null before a
+        // context exists, and caching that would leave the symbol permanently unresolvable
+        // for the rest of the process — which shows up much later as a version-specific
+        // failure, since modern Minecraft resolves far more extension entry points than the
+        // fixed-function path does.
+        return None;
+    };
+    // SAFETY: `driver_fn` already checked that T has pointer size, so this copies the
+    // function pointer's bits verbatim into a pointer-sized integer.
+    let ptr: usize = unsafe { std::mem::transmute_copy::<T, usize>(&f) };
+    {
+        let mut guard = DRIVER_CACHE.write().unwrap_or_else(|e| e.into_inner());
+        let cache = guard.get_or_insert_with(DriverCache::new);
+        cache.entry(key).or_insert(ptr);
+    }
+    Some(f)
+}
+
+/// Resolve a GLES driver symbol by name. Safe to call before a context exists.
+pub(crate) unsafe fn driver_fn<T: Copy>(name: &str) -> Option<T> {
+    if std::mem::size_of::<T>() != std::mem::size_of::<*const c_void>() {
+        log(&format!("[GLBridge] bad fn size for {name}"));
+        return None;
+    }
+    // 1) dlsym from libGLESv3/v2
+    if let Some(drv) = gles_driver() {
+        let mut buf = [0u8; 128];
+        if name.len() < buf.len() {
+            buf[..name.len()].copy_from_slice(name.as_bytes());
+            buf[name.len()] = 0;
+            if let Ok(s) = unsafe { drv.lib.get::<T>(&buf[..=name.len()]) } {
+                return Some(*s);
+            }
+        }
+    }
+    // 2) eglGetProcAddress from system libEGL (extensions + some core)
+    if let Some(ptr) = sys_egl_get_proc(name) {
+        if !ptr.is_null() {
+            return Some(std::mem::transmute_copy(&ptr));
+        }
+    }
+    None
+}
+
+/// System eglGetProcAddress (not our export) — used for GLES extension lookup.
+fn sys_egl_get_proc(name: &str) -> Option<*const c_void> {
+    static GPA: OnceLock<usize> = OnceLock::new();
+    let addr = *GPA.get_or_init(|| {
+        let paths = [
+            "/system/lib64/libEGL.so",
+            "/system/lib/libEGL.so",
+            "/vendor/lib64/libEGL.so",
+            "/vendor/lib/libEGL.so",
+            "libEGL.so",
+        ];
+        for path in paths {
+            if let Ok(lib) = unsafe { libloading::Library::new(path) } {
+                let ptr = unsafe {
+                    lib.get::<unsafe extern "C" fn()>(b"eglGetProcAddress\0")
+                        .map(|s| *s as usize)
+                        .unwrap_or(0)
+                };
+                std::mem::forget(lib);
+                if ptr != 0 {
+                    return ptr;
+                }
+            }
+        }
+        0
+    });
+    if addr == 0 {
+        return None;
+    }
+    type F = unsafe extern "C" fn(*const c_char) -> *const c_void;
+    let f: F = unsafe { std::mem::transmute(addr) };
+    let c = std::ffi::CString::new(name).ok()?;
+    Some(unsafe { f(c.as_ptr()) })
+}
+
+/// What mods and the game are told this renderer is.
+///
+/// Two things matter here. The first is honesty about the architecture: this is a
+/// desktop-GL-to-GLES *translation layer*, and several mods change behaviour when they detect
+/// one (Sodium documents that translation layers are unsupported for it, for instance), so
+/// saying "GLES passthrough" was both inaccurate and unhelpful. The second is that naming the
+/// real device driver means a bug report or a log line identifies the GPU that actually
+/// renders, instead of pointing at the layer.
+fn renderer_identity() -> (&'static CStr, &'static CStr) {
+    static IDENTITY: OnceLock<(&'static CStr, &'static CStr)> = OnceLock::new();
+    *IDENTITY.get_or_init(|| {
+        // Name the ES version the driver underneath actually reports. Hardcoding 3.2 hid
+        // the difference between a driver that can back a GL 4.5 claim and one that
+        // cannot, which is the first thing a bug report has to show.
+        let caps = gles3::caps();
+        let (major, minor) = if caps.valid { (caps.es_major, caps.es_minor) } else { (3, 2) };
+        let text = format!("OpenGL ES {major}.{minor} RustGL\0");
+        let leaked: &'static str = Box::leak(text.into_boxed_str());
+        (c"WhalterMC", CStr::from_bytes_with_nul(leaked.as_bytes()).unwrap())
+    })
+}
+
+static SPOOF_EXTENSIONS: &[u8] = b"\0"; // empty; use glGetStringi when needed
+
+#[no_mangle]
+pub extern "C" fn glGetString(name: u32) -> *const u8 {
+    // Never return null for the strings LWJGL/Minecraft always query — null here = instant crash.
+    const GL_VENDOR: u32 = 0x1F00;
+    const GL_RENDERER: u32 = 0x1F01;
+    const GL_EXTENSIONS: u32 = 0x1F03;
+
+    if spoof_gl() {
+        match name {
+            GL_VERSION => return claimed_version().2.as_ptr(),
+            GL_SHADING_LANGUAGE_VERSION => return claimed_version().3.as_ptr(),
+            GL_VENDOR => return renderer_identity().0.as_ptr() as *const u8,
+            GL_RENDERER => return renderer_identity().1.as_ptr() as *const u8,
+            GL_EXTENSIONS => return merged_extension_string().as_ptr(),
+            _ => {}
+        }
+    }
+
+    // Prefer live driver if a context is up
+    if let Some(be) = backend() {
+        let p = be.get_string(name);
+        if !p.is_null() {
+            return p;
+        }
+    }
+
+    // Direct driver call (works once a GLES context is current)
+    unsafe {
+        type F = unsafe extern "C" fn(u32) -> *const u8;
+        if let Some(f) = driver_fn_cached::<F>("glGetString") {
+            let p = f(name);
+            if !p.is_null() {
+                return p;
+            }
+        }
+    }
+
+    // Last-resort non-null fallbacks
+    match name {
+        GL_VENDOR => renderer_identity().0.as_ptr() as *const u8,
+        GL_RENDERER => renderer_identity().1.as_ptr() as *const u8,
+        GL_VERSION => claimed_version().2.as_ptr(),
+        GL_SHADING_LANGUAGE_VERSION => claimed_version().3.as_ptr(),
+        GL_EXTENSIONS => SPOOF_EXTENSIONS.as_ptr(),
+        _ => {
+            errors().set(GL_INVALID_VALUE);
+            SPOOF_EXTENSIONS.as_ptr()
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn glGetIntegerv(pname: u32, data: *mut i32) {
+    // Fog queries are answered from recorded state: ES 3.x has no fog, so forwarding them
+    // raises GL_INVALID_ENUM and desynchronises the game's cached fog state.
+    if let Some(v) = fixed_func::fog_query_i(pname) {
+        if !data.is_null() {
+            *data = v;
+        }
+        return;
+    }
+    if data.is_null() {
+        errors().set(GL_INVALID_VALUE);
+        return;
+    }
+    if let Some(value) = gl::v4_5::clip_control_value(pname) {
+        *data = value;
+        return;
+    }
+    if spoof_gl() {
+        match pname {
+            GL_MAJOR_VERSION => { *data = claimed_version().0; return; }
+            GL_MINOR_VERSION => { *data = claimed_version().1; return; }
+            0x9126 => { *data = 0x0001; return; } // GL_CONTEXT_PROFILE_MASK = CORE_PROFILE_BIT
+            GL_NUM_EXTENSIONS => {
+                *data = merged_extensions().len() as i32;
+                return;
+            }
+            _ => {}
+        }
+    }
+    if let Some(f) = driver_fn_cached::<unsafe extern "C" fn(u32, *mut i32)>("glGetIntegerv") {
+        f(remap_draw_buffer_query_pname(pname), data);
+        return;
+    }
+    // Safe zeros rather than leaving uninitialized memory for the caller
+    *data = 0;
+    errors().set(GL_INVALID_OPERATION);
+}
+
+/// Extensions this layer adds on top of the driver, filtered by what the device supports.
+///
+/// The list is computed from [`gles3::probe`] rather than fixed, so a device without a
+/// feature is not told it has one. Only advertise an alias whose entry points we actually
+/// export, or whose semantics are backed by GLES 3.x or by an implementation in
+/// gl-compat.
+fn compat_extensions() -> Vec<&'static [u8]> {
+    gles3::supported_aliases(gles3::caps())
+}
+
+const GL_NUM_EXTENSIONS: u32 = 0x821D;
+const GL_EXTENSIONS: u32 = 0x1F03;
+
+type GetIntFn = unsafe extern "C" fn(u32, *mut i32);
+type GetStringiFn = unsafe extern "C" fn(u32, u32) -> *const u8;
+type GetStringFn = unsafe extern "C" fn(u32) -> *const u8;
+
+/// Appends `name` as a NUL-terminated entry unless it is empty or already present.
+fn push_extension(out: &mut Vec<Vec<u8>>, name: &[u8]) {
+    if name.is_empty() || name.contains(&0) {
+        return;
+    }
+    let entry = [name, &[0u8]].concat();
+    if !out.iter().any(|e| e == &entry) {
+        out.push(entry);
+    }
+}
+
+/// Appends the driver's own extension names to `out` and returns how many were found.
+///
+/// # Safety
+/// Calls into the GL driver, so a context must be current. Reached only from GL entry
+/// points (`glGetString`, `glGetStringi`, `glGetIntegerv`), which guarantees that.
+unsafe fn collect_driver_extensions(out: &mut Vec<Vec<u8>>) -> usize {
+    let mut count = 0i32;
+    if let Some(get) = driver_fn_cached::<GetIntFn>("glGetIntegerv") {
+        get(GL_NUM_EXTENSIONS, &mut count);
+    }
+    let before = out.len();
+    if let Some(stringi) = driver_fn_cached::<GetStringiFn>("glGetStringi") {
+        for i in 0..count.max(0) as u32 {
+            let p = stringi(GL_EXTENSIONS, i);
+            if p.is_null() {
+                break;
+            }
+            push_extension(out, CStr::from_ptr(p as *const c_char).to_bytes());
+        }
+    } else if let Some(get_string) = driver_fn_cached::<GetStringFn>("glGetString") {
+        let p = get_string(GL_EXTENSIONS);
+        if !p.is_null() {
+            for name in CStr::from_ptr(p as *const c_char).to_bytes().split(|c| *c == b' ') {
+                push_extension(out, name);
+            }
+        }
+    }
+    out.len() - before
+}
+
+/// Holds the most recently built list so pointers handed to callers stay valid for as long
+/// as GL promises (until the next `glGetStringi`).
+static MERGED: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+/// Set once the driver has reported at least one extension. Until then the query may have
+/// happened before a context existed, so the list is rebuilt instead of cached.
+static DRIVER_LISTED: AtomicBool = AtomicBool::new(false);
+
+/// Every extension name this layer reports, NUL-terminated: the driver's own list first,
+/// then our aliases, without duplicates. `glGetStringi` and `GL_NUM_EXTENSIONS` must agree
+/// on this list — serving the two from different sources makes an iterator stop early.
+fn merged_extensions() -> Vec<Vec<u8>> {
+    {
+        let cached = MERGED.lock().unwrap_or_else(|e| e.into_inner());
+        if DRIVER_LISTED.load(Ordering::Relaxed) && !cached.is_empty() {
+            return cached.clone();
+        }
+    }
+
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    // SAFETY: only reachable from a GL entry point, so a context is current.
+    let driver_count = unsafe { collect_driver_extensions(&mut out) };
+    if driver_count > 0 {
+        DRIVER_LISTED.store(true, Ordering::Relaxed);
+    }
+    for name in compat_extensions() {
+        // The table stores each name NUL-terminated; push_extension adds its own.
+        let name = name.strip_suffix(&[0u8]).unwrap_or(name);
+        push_extension(&mut out, name);
+    }
+    if driver_count > 0 {
+        static LOGGED: AtomicBool = AtomicBool::new(false);
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            log(&format!(
+                "[GLCompat] advertising {driver_count} driver + {} compatibility extensions",
+                out.len() - driver_count
+            ));
+        }
+    }
+    if !gles3::caps().valid {
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            log("[GLCompat] capability probe failed (no context?): only ES 3.0 core aliases advertised");
+        }
+    }
+
+    *MERGED.lock().unwrap_or_else(|e| e.into_inner()) = out.clone();
+    out
+}
+
+/// `GL_EXTENSIONS` as one space-separated string.
+///
+/// GLES 3.0 defines this as an empty string — on GLES, extensions are enumerated through
+/// `glGetStringi`. So this reports the compatibility aliases only; `glGetStringi` plus
+/// `GL_NUM_EXTENSIONS` remain the authoritative, driver-inclusive list.
+fn merged_extension_string() -> &'static [u8] {
+    static STR: OnceLock<Vec<u8>> = OnceLock::new();
+    STR.get_or_init(|| {
+        let mut s = Vec::new();
+        for e in compat_extensions() {
+            if !s.is_empty() {
+                s.push(b' ');
+            }
+            s.extend_from_slice(e.strip_suffix(&[0u8]).unwrap_or(e));
+        }
+        s.push(0);
+        s
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn glGetStringi(name: u32, index: u32) -> *const u8 {
+    const GL_EXTENSIONS: u32 = 0x1F03;
+    if name == GL_EXTENSIONS {
+        // Indexed access into the same merged list GL_NUM_EXTENSIONS reports, so a caller
+        // that iterates `count` entries never hits an early null.
+        // Never return an address into the temporary clone from merged_extensions():
+        // LWJGL reads it after this function returns, when that clone has been freed.
+        if !DRIVER_LISTED.load(Ordering::Relaxed) {
+            let _ = merged_extensions();
+        }
+        let exts = MERGED.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ext) = exts.get(index as usize) {
+            return ext.as_ptr();
+        }
+        errors().set(GL_INVALID_VALUE);
+        return std::ptr::null();
+    }
+    match driver_fn_cached::<unsafe extern "C" fn(u32, u32) -> *const u8>("glGetStringi") {
+        Some(f) => f(name, index),
+        None => {
+            errors().set(GL_INVALID_OPERATION);
+            std::ptr::null()
+        }
+    }
+}
+
+/// Desktop `glClearDepth(double)` -> ES `glClearDepthf(float)`.
+#[no_mangle]
+pub unsafe extern "C" fn glClearDepth(depth: f64) {
+    match driver_fn_cached::<unsafe extern "C" fn(f32)>("glClearDepthf") {
+        Some(f) => f(depth as f32),
+        None => errors().set(GL_INVALID_OPERATION),
+    }
+}
+
+/// Desktop `glDepthRange(double, double)` -> ES `glDepthRangef(float, float)`.
+/// The fixed-function path (1.12-1.16) sets its depth range through this call.
+#[no_mangle]
+pub unsafe extern "C" fn glDepthRange(near: f64, far: f64) {
+    match driver_fn_cached::<unsafe extern "C" fn(f32, f32)>("glDepthRangef") {
+        Some(f) => f(near as f32, far as f32),
+        None => errors().set(GL_INVALID_OPERATION),
+    }
+}
+
+/// Memoized desktop-GLSL -> GLSL-ES translation.
+///
+/// The game hands the same source to `glShaderSource` over and over: every render type is a
+/// program variant (terrain cutout, entity, armor, glint, ...), and a resource reload, F3+T,
+/// a shader-pack option change, a dimension switch or a world rejoin recompiles all of them
+/// from identical strings. Translation parses and rewrites the whole shader, so each repeat
+/// costs milliseconds of CPU on a phone core - and shader packs (Iris/OptiFine) feed it
+/// sources of tens of kilobytes per pass.
+///
+/// The key is the source's fingerprint (hash + length) plus the two inputs that change the
+/// result: the ES target flag and the driver's texture-buffer support. Both are fixed for the
+/// life of a driver, but they are part of the key so a translation can never be served to a
+/// different target than the one it was produced for.
+///
+/// Bounded, because the lowest-end target here has 2 GB of RAM for the whole system: at most
+/// `SHADER_TRANSLATION_ENTRIES` entries and `SHADER_TRANSLATION_BYTES` of text, oldest first,
+/// and sources over `SHADER_TRANSLATION_MAX_SOURCE` are not cached at all.
+const SHADER_TRANSLATION_ENTRIES: usize = 128;
+const SHADER_TRANSLATION_BYTES: usize = 2 * 1024 * 1024;
+const SHADER_TRANSLATION_MAX_SOURCE: usize = 512 * 1024;
+
+/// (fingerprint, source length, target) - `target` packs the ES flag in bit 7 and the
+/// texture-buffer support in bits 0-3.
+type ShaderTranslationKey = (u64, usize, u8);
+static SHADER_TRANSLATIONS: RwLock<Option<Vec<(ShaderTranslationKey, String)>>> = RwLock::new(None);
+
+fn shader_translation_target(is_es: bool, texture_buffers: u8) -> u8 {
+    (if is_es { 0x80 } else { 0x00 }) | (texture_buffers & 0x7f)
+}
+
+fn shader_translation_key(src: &str, target: u8) -> ShaderTranslationKey {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = DefaultHasher::new();
+    hasher.write(src.as_bytes());
+    hasher.write_u8(target);
+    (hasher.finish(), src.len(), target)
+}
+
+fn cached_shader_translation(key: &ShaderTranslationKey) -> Option<String> {
+    let guard = SHADER_TRANSLATIONS.read().unwrap_or_else(|e| e.into_inner());
+    let entries = guard.as_ref()?;
+    entries
+        .iter()
+        .find(|(candidate, _)| candidate == key)
+        .map(|(_, translated)| translated.clone())
+}
+
+fn remember_shader_translation(key: ShaderTranslationKey, translated: &str) {
+    if translated.len() > SHADER_TRANSLATION_MAX_SOURCE {
+        return;
+    }
+    let mut guard = SHADER_TRANSLATIONS.write().unwrap_or_else(|e| e.into_inner());
+    let entries = guard.get_or_insert_with(Vec::new);
+    if entries.iter().any(|(candidate, _)| *candidate == key) {
+        return;
+    }
+    let mut bytes: usize = entries.iter().map(|(_, text)| text.len()).sum();
+    while entries.len() >= SHADER_TRANSLATION_ENTRIES
+        || bytes + translated.len() > SHADER_TRANSLATION_BYTES
+    {
+        if entries.is_empty() {
+            return;
+        }
+        bytes = bytes.saturating_sub(entries.remove(0).1.len());
+    }
+    entries.push((key, translated.to_string()));
+}
+
+/// Joins the source strings, rewrites desktop GLSL to GLSL ES, and hands one string to the driver.
+#[no_mangle]
+pub unsafe extern "C" fn glShaderSource(
+    shader: u32,
+    count: i32,
+    string: *const *const c_char,
+    length: *const i32,
+) {
+    if count < 0 || (count > 0 && string.is_null()) {
+        errors().set(GL_INVALID_VALUE);
+        return;
+    }
+    let mut src = String::new();
+    for i in 0..count as usize {
+        let sp = *string.add(i);
+        if sp.is_null() {
+            continue;
+        }
+        let len = if length.is_null() { -1 } else { *length.add(i) };
+        let bytes: &[u8] = if len < 0 {
+            CStr::from_ptr(sp).to_bytes()
+        } else {
+            std::slice::from_raw_parts(sp as *const u8, len as usize)
+        };
+        src.push_str(&String::from_utf8_lossy(bytes));
+    }
+    let is_es = shader_translation_is_es();
+    let support = gles3::texture_buffer_support(&gles3::caps());
+    let target = shader_translation_target(is_es, support as u8);
+    let key = shader_translation_key(&src, target);
+    let translated = match cached_shader_translation(&key) {
+        Some(translated) => translated,
+        None => {
+            let translated = if is_es {
+                shader_translate::translate_with_texture_buffers(&src, support)
+            } else {
+                shader_translate::translate_desktop_450(&src)
+            };
+            let translated = match translated {
+                Ok(t) => t,
+                Err(e) => {
+                    // Preserve a real compile failure. A valid white fragment shader or a
+                    // vertex shader at (0,0,0,0) hides unsupported features as a successful
+                    // blank frame.
+                    log(&format!("[ShaderTranslate] shader {shader} rejected: {e}"));
+                    "#error RustGL shader translation failed; see renderer log\n".into()
+                }
+            };
+            remember_shader_translation(key, &translated);
+            translated
+        }
+    };
+    // TEMP(debug): capture every shader source so translation gaps can be reproduced offline.
+    if let Ok(dir) = std::env::var("RENDERER_DUMP_SHADER_DIR") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::File::create(format!("{dir}/{shader}.src")) {
+            let _ = f.write_all(src.as_bytes());
+        }
+        if let Ok(mut f) = std::fs::File::create(format!("{dir}/{shader}.translated")) {
+            let _ = f.write_all(translated.as_bytes());
+        }
+    }
+    let c = match CString::new(translated.as_str()) {
+        Ok(c) => c,
+        Err(_) => {
+            errors().set(GL_INVALID_VALUE);
+            return;
+        }
+    };
+    remember_shader_source(shader, translated);
+    match driver_fn_cached::<unsafe extern "C" fn(u32, i32, *const *const c_char, *const i32)>("glShaderSource") {
+        Some(f) => {
+            let ptr = c.as_ptr();
+            f(shader, 1, &ptr, std::ptr::null());
+        }
+        None => errors().set(GL_INVALID_OPERATION),
+    }
+}
+
+
+const GL_COMPILE_STATUS: u32 = 0x8B81;
+const GL_LINK_STATUS: u32 = 0x8B82;
+const GL_INFO_LOG_LENGTH: u32 = 0x8B84;
+
+/// Reports translated shader failures with the backend compiler log. Vanilla world shaders
+/// can fail compilation while all later draw calls still appear valid in an apitrace.
+#[no_mangle]
+pub unsafe extern "C" fn glCompileShader(shader: u32) {
+    trace_call("glCompileShader");
+    let Some(compile) = driver_fn_cached::<unsafe extern "C" fn(u32)>("glCompileShader") else {
+        errors().set(GL_INVALID_OPERATION);
+        return;
+    };
+    compile(shader);
+    // Drivers that advertise GL_KHR_parallel_shader_compile compile in the background, and
+    // reading GL_COMPILE_STATUS is the operation that waits for them to finish. Minecraft and
+    // every shader pack compile their programs in a loop, so this one query is the difference
+    // between compiles overlapping and one stall per shader. Nothing is lost: the status is
+    // still reported, with the driver's info log, from `glGetShaderiv`, which the game calls
+    // before it uses the shader anyway.
+    if parallel_shader_compile() {
+        return;
+    }
+    let Some(get_shader_iv) = driver_fn_cached::<unsafe extern "C" fn(u32, u32, *mut i32)>("glGetShaderiv") else {
+        return;
+    };
+    let mut status = 0;
+    get_shader_iv(shader, GL_COMPILE_STATUS, &mut status);
+    if status != 0 || !log_failure_once(&COMPILE_FAILURES_LOGGED, shader) {
+        take_shader_source(shader);
+        return;
+    }
+    report_compile_failure(shader);
+}
+
+/// Whether the driver can compile and link shaders in the background
+/// (`GL_KHR_parallel_shader_compile`). Adreno and Mali expose it, PowerVR generally does not.
+/// The answer is cached with the rest of the capability probe.
+fn parallel_shader_compile() -> bool {
+    gles3::caps().has(b"GL_KHR_parallel_shader_compile")
+}
+
+/// Reports a failed compile with the driver's info log and the translated source.
+///
+/// Called from `glCompileShader` on drivers that compile synchronously, and from
+/// `glGetShaderiv` on drivers that do not - the status read is the first point at which a
+/// background compile's result is known.
+unsafe fn report_compile_failure(shader: u32) {
+    let Some(get_shader_iv) = driver_fn_cached::<unsafe extern "C" fn(u32, u32, *mut i32)>("glGetShaderiv") else {
+        return;
+    };
+    let mut length = 0;
+    get_shader_iv(shader, GL_INFO_LOG_LENGTH, &mut length);
+    if length <= 1 {
+        log(&format!("[GLCompat] compile failed shader={shader}: driver returned no info log"));
+        return;
+    }
+    let Some(get_shader_log) = driver_fn_cached::<unsafe extern "C" fn(u32, i32, *mut i32, *mut c_char)>("glGetShaderInfoLog") else {
+        log(&format!("[GLCompat] compile failed shader={shader}: glGetShaderInfoLog unavailable"));
+        return;
+    };
+    let mut bytes = vec![0u8; length as usize];
+    let mut written = 0;
+    get_shader_log(shader, length, &mut written, bytes.as_mut_ptr() as *mut c_char);
+    let written = written.max(0) as usize;
+    let message = String::from_utf8_lossy(&bytes[..written.min(bytes.len())]);
+    log(&format!("[GLCompat] compile failed shader={shader}: {message}"));
+    if let (Some(source), Some(line)) = (take_shader_source(shader), shader_error_line(&message)) {
+        // Prefer the `#line`-aware physical line; fall back to the raw number if the
+        // directives do not account for it.
+        let line = shader_error_location(&message)
+            .and_then(|(string, reported)| physical_line_for_error(&source, string, reported))
+            .unwrap_or(line);
+        let lines: Vec<&str> = source.lines().collect();
+        let start = line.saturating_sub(9);
+        let end = (line + 3).min(lines.len());
+        if start < end {
+            let excerpt = lines[start..end]
+                .iter()
+                .enumerate()
+                .map(|(offset, text)| format!("{}: {}", start + offset + 1, text))
+                .collect::<Vec<_>>()
+                .join("\n");
+            log(&format!("[Shader] shader {shader} translated source context:\n{excerpt}"));
+            
+            let directives = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, text)| text.trim_start().starts_with('#'))
+                .take(80)
+                .map(|(index, text)| format!("{}: {}", index + 1, text.trim()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            log(&format!("[Shader] shader {shader} preprocessor lines:\n{directives}"));
+        }
+    }
+}
+
+/// Forwards `glGetShaderiv` and reports compile failures.
+///
+/// Hand-written instead of being generated by `forward_all!` so the status read - the
+/// synchronisation point for a background compile, see `glCompileShader` - is also where a
+/// failure is logged. Every other pname is passed straight through.
+#[no_mangle]
+pub unsafe extern "C" fn glGetShaderiv(shader: u32, pname: u32, params: *mut i32) {
+    trace_call("glGetShaderiv");
+    let Some(get_shader_iv) = driver_fn_cached::<unsafe extern "C" fn(u32, u32, *mut i32)>("glGetShaderiv") else {
+        errors().set(GL_INVALID_OPERATION);
+        return;
+    };
+    get_shader_iv(shader, pname, params);
+    if pname != GL_COMPILE_STATUS || params.is_null() {
+        return;
+    }
+    if *params != 0 {
+        take_shader_source(shader);
+        return;
+    }
+    if !log_failure_once(&COMPILE_FAILURES_LOGGED, shader) {
+        take_shader_source(shader);
+        return;
+    }
+    report_compile_failure(shader);
+}
+
+/// The program the last `glUseProgram` bound, tracked so the draw paths do not have to ask the
+/// driver. `glDrawArrays` runs this check on every call, and `glGetIntegerv` per draw is a
+/// driver round trip the weakest devices cannot absorb.
+static CURRENT_PROGRAM: AtomicU32 = AtomicU32::new(0);
+
+/// The program the game has bound, or 0 when it is drawing fixed-function.
+#[inline]
+pub(crate) fn current_program() -> u32 {
+    CURRENT_PROGRAM.load(Ordering::Relaxed)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn glUseProgram(program: u32) {
+    trace_call("glUseProgram");
+    CURRENT_PROGRAM.store(program, Ordering::Relaxed);
+    match driver_fn_cached::<unsafe extern "C" fn(u32)>("glUseProgram") {
+        Some(f) => f(program),
+        None => errors().set(GL_INVALID_OPERATION),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn glDeleteProgram(program: u32) {
+    trace_call("glDeleteProgram");
+    // Deleting the bound program reverts to "no program", as the driver does.
+    if CURRENT_PROGRAM.load(Ordering::Relaxed) == program {
+        CURRENT_PROGRAM.store(0, Ordering::Relaxed);
+    }
+    fixed_draw::forget_legacy_locations(program);
+    match driver_fn_cached::<unsafe extern "C" fn(u32)>("glDeleteProgram") {
+        Some(f) => f(program),
+        None => errors().set(GL_INVALID_OPERATION),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn glLinkProgram(program: u32) {
+    trace_call("glLinkProgram");
+    // A re-linked program does not keep the locations the legacy-shader draw path cached.
+    fixed_draw::forget_legacy_locations(program);
+    let Some(link) = driver_fn_cached::<unsafe extern "C" fn(u32)>("glLinkProgram") else {
+        errors().set(GL_INVALID_OPERATION);
+        return;
+    };
+    link(program);
+    // Same reasoning as `glCompileShader`: asking for GL_LINK_STATUS blocks until the driver
+    // has finished, so on drivers that link in the background the wait belongs to the caller
+    // that needs the answer (`glGetProgramiv`), not to the submit.
+    if parallel_shader_compile() {
+        return;
+    }
+    let Some(get_program_iv) =
+        driver_fn_cached::<unsafe extern "C" fn(u32, u32, *mut i32)>("glGetProgramiv")
+    else {
+        return;
+    };
+    let mut status = 0;
+    get_program_iv(program, GL_LINK_STATUS, &mut status);
+    if status != 0 || !log_failure_once(&LINK_FAILURES_LOGGED, program) {
+        return;
+    }
+    report_link_failure(program);
+}
+
+/// Reports a failed link with the driver's info log. See [`report_compile_failure`].
+unsafe fn report_link_failure(program: u32) {
+    let Some(get_program_iv) =
+        driver_fn_cached::<unsafe extern "C" fn(u32, u32, *mut i32)>("glGetProgramiv")
+    else {
+        return;
+    };
+    let mut length = 0;
+    get_program_iv(program, GL_INFO_LOG_LENGTH, &mut length);
+    if length <= 1 {
+        log(&format!("[GLCompat] link failed program={program}: driver returned no info log"));
+        return;
+    }
+    let Some(get_program_log) =
+        driver_fn_cached::<unsafe extern "C" fn(u32, i32, *mut i32, *mut c_char)>(
+            "glGetProgramInfoLog",
+        )
+    else {
+        log(&format!("[GLCompat] link failed program={program}: glGetProgramInfoLog unavailable"));
+        return;
+    };
+    let mut bytes = vec![0u8; length as usize];
+    let mut written = 0;
+    get_program_log(program, length, &mut written, bytes.as_mut_ptr() as *mut c_char);
+    let written = written.max(0) as usize;
+    let message = String::from_utf8_lossy(&bytes[..written.min(bytes.len())]);
+    log(&format!("[GLCompat] link failed program={program}: {message}"));
+}
+
+/// Forwards `glGetProgramiv` and reports link failures. See [`glGetShaderiv`]: on drivers
+/// that link in the background this is where the result becomes visible.
+#[no_mangle]
+pub unsafe extern "C" fn glGetProgramiv(program: u32, pname: u32, params: *mut i32) {
+    trace_call("glGetProgramiv");
+    let Some(get_program_iv) = driver_fn_cached::<unsafe extern "C" fn(u32, u32, *mut i32)>("glGetProgramiv") else {
+        errors().set(GL_INVALID_OPERATION);
+        return;
+    };
+    get_program_iv(program, pname, params);
+    if pname != GL_LINK_STATUS || params.is_null() || *params != 0 {
+        return;
+    }
+    if !log_failure_once(&LINK_FAILURES_LOGGED, program) {
+        return;
+    }
+    report_link_failure(program);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn glCreateProgram() -> u32 {
+    trace_call("glCreateProgram");
+    let Some(create) = driver_fn_cached::<unsafe extern "C" fn() -> u32>("glCreateProgram") else {
+        errors().set(GL_INVALID_OPERATION);
+        return 0;
+    };
+    let program = create();
+    clear_logged_failure(&LINK_FAILURES_LOGGED, program);
+    program
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn glCreateShader(shader_type: u32) -> u32 {
+    trace_call("glCreateShader");
+    let Some(create) = driver_fn_cached::<unsafe extern "C" fn(u32) -> u32>("glCreateShader") else {
+        errors().set(GL_INVALID_OPERATION);
+        return 0;
+    };
+    let shader = create(shader_type);
+    clear_logged_failure(&COMPILE_FAILURES_LOGGED, shader);
+    shader
+}
+
+// ---- translated entry points (desktop semantics -> GLES) -------------------------------
+
+/// Pixel-unpack state that the upload path depends on.
+///
+/// Tracked locally instead of queried: the previous implementation issued three
+/// `glGetIntegerv` driver round-trips *per texture upload*, which for a texture-atlas-heavy
+/// frame is thousands of needless calls. Every mutation of these enums arrives through
+/// `glPixelStorei`, which updates this state, so the shadow cannot drift from the driver.
+static UNPACK_ROW_LENGTH: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static UNPACK_SKIP_ROWS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static UNPACK_SKIP_PIXELS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static UNPACK_ALIGNMENT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(4);
+
+const GL_UNPACK_ALIGNMENT: u32 = 0x0CF5;
+
+use std::sync::atomic::Ordering as AtomicOrdering;
+
+fn set_unpack_row_length(v: i32) {
+    UNPACK_ROW_LENGTH.store(v, AtomicOrdering::Relaxed);
+}
+fn set_unpack_skip_rows(v: i32) {
+    UNPACK_SKIP_ROWS.store(v, AtomicOrdering::Relaxed);
+}
+fn set_unpack_skip_pixels(v: i32) {
+    UNPACK_SKIP_PIXELS.store(v, AtomicOrdering::Relaxed);
+}
+fn set_unpack_alignment(v: i32) {
+    UNPACK_ALIGNMENT.store(v, AtomicOrdering::Relaxed);
+}
+
+/// True when pixel-unpack state is default (no row length / skip), so a tight copy is valid.
+fn unpack_is_tight() -> bool {
+    UNPACK_ROW_LENGTH.load(AtomicOrdering::Relaxed) == 0
+        && UNPACK_SKIP_ROWS.load(AtomicOrdering::Relaxed) == 0
+        && UNPACK_SKIP_PIXELS.load(AtomicOrdering::Relaxed) == 0
+}
+
+/// Records unpack state changes that matter to the BGRA/BGR conversion path.
+fn track_pixel_store(pname: u32, value: i32) {
+    match pname {
+        0x0CF2 => set_unpack_row_length(value),  // GL_UNPACK_ROW_LENGTH
+        0x0CF3 => set_unpack_skip_rows(value),   // GL_UNPACK_SKIP_ROWS
+        0x0CF4 => set_unpack_skip_pixels(value), // GL_UNPACK_SKIP_PIXELS
+        GL_UNPACK_ALIGNMENT => set_unpack_alignment(value),
+        _ => {}
+    }
+}
+
+/// For BGRA/BGR uploads returns a converted RGB(A) copy; None means use caller data as-is.
+pub(crate) unsafe fn convert_pixel_upload(w: i32, h: i32, f: u32, ty: u32, d: *const c_void) -> Option<(u32, u32, Vec<u8>)> {
+    if d.is_null() || w <= 0 || h <= 0 {
+        return None;
+    }
+    if !unpack_is_tight() {
+        if format_translate::is_bgra8(f, ty) || format_translate::is_bgr8(f, ty) {
+            log("[GLCompat] BGR(A) upload with non-default unpack state: passed through");
+        }
+        return None;
+    }
+    let n = (w as usize) * (h as usize);
+    if format_translate::is_bgra8(f, ty) {
+        let src = std::slice::from_raw_parts(d as *const u8, n * 4);
+        return Some((
+            format_translate::GL_RGBA,
+            format_translate::GL_UNSIGNED_BYTE,
+            format_translate::swizzle_bgra_to_rgba(src, n),
+        ));
+    }
+    if format_translate::is_bgr8(f, ty) {
+        let src = std::slice::from_raw_parts(d as *const u8, n * 3);
+        return Some((
+            format_translate::GL_RGB,
+            format_translate::GL_UNSIGNED_BYTE,
+            format_translate::swizzle_bgr_to_rgb(src, n),
+        ));
+    }
+    None
+}
+
+/// Renderbuffer storage has no format/type pair, so only the BGRA/BGR internal-format
+/// aliases need translating before the call reaches GLES.
+/// Forwards to the driver and keeps the unpack shadow the BGRA/BGR conversion path reads,
+/// so uploads no longer query the driver for these enums.
+#[no_mangle]
+pub unsafe extern "C" fn glPixelStorei(n: u32, v: i32) {
+    track_pixel_store(n, v);
+    match driver_fn_cached::<unsafe extern "C" fn(u32, i32)>("glPixelStorei") {
+        Some(f) => f(n, v),
+        None => errors().set(GL_INVALID_OPERATION),
+    }
+}
+
+/// Keeps the `GL_ARRAY_BUFFER` shadow in step with the driver.
+#[no_mangle]
+pub unsafe extern "C" fn glBindBuffer(t: u32, b: u32) {
+    if t == 0x8892 /* GL_ARRAY_BUFFER */ {
+        set_array_buffer_binding(b);
+    } else if t == 0x8893 /* GL_ELEMENT_ARRAY_BUFFER */ {
+        // GLES buffer names are per-target, so a buffer created via glCreateBuffers only has
+        // storage on the target it was first filled on. Materialise it on this target too.
+        vertex_state::note_buffer_target(b, t);
+    }
+    match driver_fn_cached::<unsafe extern "C" fn(u32, u32)>("glBindBuffer") {
+        Some(f) => f(t, b),
+        None => errors().set(GL_INVALID_OPERATION),
+    }
+}
+
+
+
+fn fbo_status_name(status: u32) -> &'static str {
+    match status {
+        0x8CD5 => "COMPLETE",
+        0x8CD6 => "INCOMPLETE_ATTACHMENT",
+        0x8CD7 => "INCOMPLETE_MISSING_ATTACHMENT",
+        0x8CD9 => "INCOMPLETE_DIMENSIONS",
+        0x8CDD => "UNSUPPORTED",
+        0x8D56 => "INCOMPLETE_MULTISAMPLE",
+        0x8DA8 => "INCOMPLETE_LAYER_TARGETS",
+        _ => "UNKNOWN",
+    }
+}
+
+/// `glCheckFramebufferStatus` that explains itself. A bare 0x8CD6 from a shader pack says
+/// nothing about *which* attachment failed; this logs type, name and channel sizes of every
+/// attachment of the incomplete framebuffer (a size of 0 means the texture never got storage,
+/// usually because the allocation was rejected). Rate limited so a per-frame check cannot
+/// flood logcat.
+pub(crate) unsafe fn checked_framebuffer_status(target: u32) -> u32 {
+    let Some(check) = driver_fn_cached::<unsafe extern "C" fn(u32) -> u32>("glCheckFramebufferStatus")
+    else {
+        errors().set(GL_INVALID_OPERATION);
+        return 0;
+    };
+    let status = check(target);
+    if status == 0x8CD5 || status == 0 {
+        return status;
+    }
+    static REPORTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if REPORTED.fetch_add(1, Ordering::Relaxed) >= 16 {
+        return status;
+    }
+    log(&format!(
+        "[GLCompat] framebuffer incomplete: 0x{status:04X} ({})",
+        fbo_status_name(status)
+    ));
+    let Some(get) = driver_fn_cached::<unsafe extern "C" fn(u32, u32, u32, *mut i32)>(
+        "glGetFramebufferAttachmentParameteriv",
+    ) else {
+        return status;
+    };
+    let max_color = gles3::caps().max_color_attachments.clamp(1, 8) as u32;
+    let mut atts: Vec<u32> = (0..max_color).map(|i| 0x8CE0 + i).collect();
+    atts.push(0x8D00); // DEPTH
+    atts.push(0x8D20); // STENCIL
+    for att in atts {
+        let q = |pname: u32| -> i32 {
+            let mut v = -1i32;
+            get(target, att, pname, &mut v);
+            v
+        };
+        let kind = q(0x8CD0); // OBJECT_TYPE
+        if kind <= 0 || kind == 0x0000 {
+            continue; // GL_NONE or query rejected
+        }
+        let kind_name = match kind as u32 {
+            0x1702 => "TEXTURE",
+            0x8D41 => "RENDERBUFFER",
+            _ => "?",
+        };
+        log(&format!(
+            "[GLCompat]   attachment {att:#06x}: {kind_name} name={} rgba={}/{}/{}/{} depth={} stencil={} type={:#06x}",
+            q(0x8CD1),
+            q(0x8212), q(0x8213), q(0x8214), q(0x8215),
+            q(0x8216), q(0x8217), q(0x8211),
+        ));
+    }
+    // The queries above can leave driver errors behind that the application never caused.
+    let _ = errors().take();
+    status
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn glCheckFramebufferStatus(target: u32) -> u32 {
+    trace_call("glCheckFramebufferStatus");
+    checked_framebuffer_status(target)
+}
+
+/// What the GPU can render to, from the capability probe. Before a context exists nothing is
+/// downgraded.
+pub(crate) fn render_caps() -> format_translate::RenderCaps {
+    let c = gles3::caps();
+    if !c.valid {
+        return format_translate::RenderCaps::default();
+    }
+    format_translate::RenderCaps {
+        float_rt: c.supports_float_color_targets(),
+        half_float_rt: c.supports_half_float_color_targets(),
+        norm16: c.has(b"GL_EXT_texture_norm16\0"),
+    }
+}
+
+/// Whether texture buffers are supported (ES 3.2+ or GL_EXT_texture_buffer).
+pub(crate) fn has_texture_buffer() -> bool {
+    let c = gles3::caps();
+    c.valid && c.has_texture_buffer
+}
+
+/// Whether texture view is supported (ES 3.2+ or GL_EXT_texture_view).
+pub(crate) fn has_texture_view() -> bool {
+    let c = gles3::caps();
+    c.valid && c.has_texture_view
+}
+
+/// Whether atomic counters are supported (ES 3.1+ or GL_EXT_shader_atomic_counters / GL_OES_shader_atomic_counters).
+pub(crate) fn has_atomic_counter() -> bool {
+    let c = gles3::caps();
+    c.valid && c.has_atomic_counter
+}
+
+/// Whether shader image load/store is supported (ES 3.1+ or GL_EXT_shader_image_load_store).
+pub(crate) fn has_shader_image_load_store() -> bool {
+    let c = gles3::caps();
+    c.valid && c.has_shader_image_load_store
+}
+
+/// Whether double-precision vertex attributes (GL 4.1 / ARB_vertex_attrib_64bit) are supported.
+pub(crate) fn has_vertex_attrib_64bit() -> bool {
+    let c = gles3::caps();
+    c.valid && c.has_vertex_attrib_64bit
+}
+
+/// Whether GL_ARB_provoking_vertex (LAST_VERTEX_CONVENTION) is supported.
+pub(crate) fn has_provoking_vertex() -> bool {
+    let c = gles3::caps();
+    c.valid && c.has_provoking_vertex
+}
+
+
+/// Logs each distinct internal-format/type rewrite once, so a logcat shows exactly which
+/// shader-pack render-target formats were adapted without needing RENDERER_TRACE_GL.
+pub(crate) fn note_format_change(site: &str, from: (u32, u32, u32), to: (u32, u32, u32)) {
+    static SEEN: std::sync::Mutex<Vec<((u32, u32, u32), (u32, u32, u32))>> =
+        std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() < 64 && !seen.contains(&(from, to)) {
+        seen.push((from, to));
+        log(&format!(
+            "[GLCompat] {site}: format {:#06x}/{:#06x}/{:#06x} -> {:#06x}/{:#06x}/{:#06x}",
+            from.0, from.1, from.2, to.0, to.1, to.2
+        ));
+    }
+}
+
+/// Attaches a texture, redirecting to the renderbuffer substitute when a multisample texture
+/// (depth/stencil or colour) could not be represented in ES. See `dsa_named` for why that
+/// substitution exists: ES has no multisample depth textures, and some drivers also reject
+/// multisample colour textures, so `glTexStorage2DMultisample` falls back to a renderbuffer in
+/// both cases. The later `glFramebufferTexture2D` has to use that renderbuffer instead.
+#[no_mangle]
+pub unsafe extern "C" fn glFramebufferTexture2D(t: u32, a: u32, tt: u32, tex: u32, l: i32) {
+    const GL_TEXTURE_2D_MULTISAMPLE: u32 = 0x9100;
+    const GL_RENDERBUFFER: u32 = 0x8D41;
+    const GL_FRAMEBUFFER: u32 = 0x8D40;
+    const GL_COLOR_ATTACHMENT0: u32 = 0x8CE0;
+    const GL_COLOR_ATTACHMENT15: u32 = 0x8CEF;
+    if tt == GL_TEXTURE_2D_MULTISAMPLE
+        && (matches!(a, 0x8D00 | 0x8D20 | 0x821A)
+            || (a >= GL_COLOR_ATTACHMENT0 && a <= GL_COLOR_ATTACHMENT15))
+    {
+        if let Some(rbo) = named_objects::msaa_substitute_for(tex) {
+            if let Some(f) =
+                driver_fn_cached::<unsafe extern "C" fn(u32, u32, u32, u32)>(
+                    "glFramebufferRenderbuffer",
+                )
+            {
+                f(GL_FRAMEBUFFER, a, GL_RENDERBUFFER, rbo);
+                return;
+            }
+        }
+    }
+    match driver_fn_cached::<unsafe extern "C" fn(u32, u32, u32, u32, i32)>(
+        "glFramebufferTexture2D",
+    ) {
+        Some(f) => f(t, a, tt, tex, l),
+        None => errors().set(GL_INVALID_OPERATION),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn glRenderbufferStorage(t: u32, f: u32, w: i32, h: i32) {
+    let f2 = format_translate::map_storage_internal(f, render_caps());
+    if f2 != f {
+        note_format_change("glRenderbufferStorage", (f, 0, 0), (f2, 0, 0));
+    }
+    match driver_fn_cached::<unsafe extern "C" fn(u32, u32, i32, i32)>("glRenderbufferStorage") {
+        Some(g) => g(t, f2, w, h),
+        None => errors().set(GL_INVALID_OPERATION),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn glTexImage2D(
+    t: u32, l: i32, ifmt: i32, w: i32, h: i32, b: i32, f: u32, ty: u32, d: *const c_void,
+) {
+    // Desktop proxy texture probe (Minecraft max texture size detection)
+    let max_tex = backend().map(|b| b.capabilities().max_texture_size).unwrap_or(2048);
+    if fixed_func::handle_proxy_tex_image(t, w, h, max_tex) {
+        return;
+    }
+    // The whole format triple has to be mapped, not just the internal format: ES requires a
+    // sized depth internal format to be paired with a matching type.
+    // With NULL data (render-target allocation) the pair is replaced by the one ES 3.0
+    // accepts and unrenderable internal formats (RGB16F, RGBA16, ...) are swapped for the
+    // nearest renderable one. Real pixel data keeps its layout. See `conform_upload`.
+    let (ifmt2, f2, ty2) =
+        format_translate::conform_upload(ifmt, f, ty, !d.is_null(), render_caps());
+    if ifmt2 != ifmt || f2 != f || ty2 != ty {
+        trace_translation(&format!("texImage2D format {ifmt:#06x}/{f:#06x}/{ty:#06x} -> {ifmt2:#06x}/{f2:#06x}/{ty2:#06x}"));
+        note_format_change("glTexImage2D", (ifmt as u32, f, ty), (ifmt2 as u32, f2, ty2));
+    }
+    let f = f2;
+    let ty = ty2;
+    let conv = convert_pixel_upload(w, h, f, ty, d);
+    let (f2, ty2, ptr) = match &conv {
+        Some((nf, nty, v)) => (*nf, *nty, v.as_ptr() as *const c_void),
+        None => (format_translate::map_external_format(f), ty, d),
+    };
+    type F = unsafe extern "C" fn(u32, i32, i32, i32, i32, i32, u32, u32, *const c_void);
+    match driver_fn_cached::<F>("glTexImage2D") {
+        Some(g) => g(t, l, ifmt2, w, h, b, f2, ty2, ptr),
+        None => errors().set(GL_INVALID_OPERATION),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn glTexSubImage2D(
+    t: u32, l: i32, x: i32, y: i32, w: i32, h: i32, f: u32, ty: u32, d: *const c_void,
+) {
+    let conv = convert_pixel_upload(w, h, f, ty, d);
+    let (f2, ty2, ptr) = match &conv {
+        Some((nf, nty, v)) => (*nf, *nty, v.as_ptr() as *const c_void),
+        None => (format_translate::map_external_format(f), ty, d),
+    };
+    type F = unsafe extern "C" fn(u32, i32, i32, i32, i32, i32, u32, u32, *const c_void);
+    match driver_fn_cached::<F>("glTexSubImage2D") {
+        Some(g) => g(t, l, x, y, w, h, f2, ty2, ptr),
+        None => errors().set(GL_INVALID_OPERATION),
+    }
+}
+
+
+/// `GL_TEXTURE_MAX_ANISOTROPY_EXT` only exists where the driver advertises it, and the
+/// usable value is capped by `GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT`. Deciding once keeps the
+/// four `glTexParameter*` wrappers from each re-deriving it.
+fn anisotropy_supported() -> bool {
+    gles3::caps().has(b"GL_EXT_texture_filter_anisotropic\0") && gles3::caps().max_anisotropy > 1
+}
+
+/// Translates a texture pname using the probed capabilities.
+fn map_tex_parameter(pname: u32) -> Option<u32> {
+    fixed_func::map_tex_parameter_with(pname, anisotropy_supported())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn glTexParameteri(t: u32, p: u32, v: i32) {
+    let Some(p2) = map_tex_parameter(p) else {
+        return; // desktop-only pname — drop silently
+    };
+    let is_wrap = matches!(p2, 0x2802 | 0x2803 | 0x8072);
+    if is_wrap && v == format_translate::GL_CLAMP_TO_BORDER && !gles3::caps().has_border_clamp() {
+        log("[GLCompat] GL_CLAMP_TO_BORDER → clamp-to-edge (driver lacks EXT_texture_border_clamp)");
+    }
+    // Without the border-clamp extension, CLAMP_TO_BORDER is an invalid enum in ES.
+    let v2 = if is_wrap && !gles3::caps().has_border_clamp() {
+        format_translate::map_wrap(v)
+    } else if is_wrap {
+        v
+    } else {
+        v
+    };
+    match driver_fn_cached::<unsafe extern "C" fn(u32, u32, i32)>("glTexParameteri") {
+        Some(g) => g(t, p2, v2),
+        None => errors().set(GL_INVALID_OPERATION),
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn glTexParameterf(t: u32, p: u32, v: f32) {
+    let Some(p2) = map_tex_parameter(p) else { return; };
+    let is_wrap = matches!(p2, 0x2802 | 0x2803 | 0x8072);
+    let v2 = if is_wrap { format_translate::map_wrap(v as i32) as f32 } else { v };
+    match driver_fn_cached::<unsafe extern "C" fn(u32, u32, f32)>("glTexParameterf") {
+        Some(g) => g(t, p2, v2),
+        None => {
+            // fall back to integer path
+            match driver_fn_cached::<unsafe extern "C" fn(u32, u32, i32)>("glTexParameteri") {
+                Some(g) => g(t, p2, v2 as i32),
+                None => errors().set(GL_INVALID_OPERATION),
+            }
+        }
+    }
+}
+
+/// Vector forms take the same state as the scalar ones. Wrap modes live in `params[0]`,
+/// and for every other pname GL requires the array length to match, so forwarding the
+/// caller's pointer unchanged is correct once pname has been translated.
+#[no_mangle]
+pub unsafe extern "C" fn glTexParameteriv(t: u32, p: u32, params: *const i32) {
+    if params.is_null() {
+        errors().set(GL_INVALID_VALUE);
+        return;
+    }
+    let Some(p2) = map_tex_parameter(p) else {
+        return; // desktop-only pname — drop silently
+    };
+    if !matches!(p2, 0x2802 | 0x2803 | 0x8072) {
+        match driver_fn_cached::<unsafe extern "C" fn(u32, u32, *const i32)>("glTexParameteriv") {
+            Some(g) => g(t, p2, params),
+            None => errors().set(GL_INVALID_OPERATION),
+        }
+        return;
+    }
+    // CLAMP/CLAMP_TO_BORDER are not in ES 3.x: swap in the translated value. The caller's
+    // buffer is const, so translate through a one-element scratch array.
+    let wrapped = [format_translate::map_wrap(*params)];
+    match driver_fn_cached::<unsafe extern "C" fn(u32, u32, *const i32)>("glTexParameteriv") {
+        Some(g) => g(t, p2, wrapped.as_ptr()),
+        None => errors().set(GL_INVALID_OPERATION),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn glTexParameterfv(t: u32, p: u32, params: *const f32) {
+    if params.is_null() {
+        errors().set(GL_INVALID_VALUE);
+        return;
+    }
+    let Some(p2) = map_tex_parameter(p) else {
+        return; // desktop-only pname — drop silently
+    };
+    if !matches!(p2, 0x2802 | 0x2803 | 0x8072) {
+        match driver_fn_cached::<unsafe extern "C" fn(u32, u32, *const f32)>("glTexParameterfv") {
+            Some(g) => g(t, p2, params),
+            None => errors().set(GL_INVALID_OPERATION),
+        }
+        return;
+    }
+    let wrapped = [format_translate::map_wrap(*params as i32) as f32];
+    match driver_fn_cached::<unsafe extern "C" fn(u32, u32, *const f32)>("glTexParameterfv") {
+        Some(g) => g(t, p2, wrapped.as_ptr()),
+        None => errors().set(GL_INVALID_OPERATION),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn glGetTexLevelParameteriv(target: u32, level: i32, pname: u32, params: *mut i32) {
+    if fixed_func::handle_get_tex_level_parameter(target, level, pname, params) {
+        return;
+    }
+    match driver_fn_cached::<unsafe extern "C" fn(u32, i32, u32, *mut i32)>("glGetTexLevelParameteriv") {
+        Some(g) => g(target, level, pname, params),
+        None => {
+            // ES often lacks this — soft-fail
+            if !params.is_null() {
+                *params = 0;
+            }
+            errors().set(GL_INVALID_OPERATION);
+        }
+    }
+}
+
+
+/// Desktop `glDrawBuffer(mode)` -> ES `glDrawBuffers(1, &mode)`.
+/// MRT draw-buffer selection, clamped to what the device actually supports.
+///
+/// Shader packs ask for as many layers as they declare (Complementary uses up to eight).
+/// ES 3.0 only guarantees four colour attachments, and passing the pack's full count to a
+/// driver that cannot honour it raises GL_INVALID_OPERATION — which shows up as a black or
+/// half-rendered world rather than a diagnosable error. Clamping keeps the frame drawing.
+///
+/// The clamp uses the *smaller* of `GL_MAX_DRAW_BUFFERS` and `GL_MAX_COLOR_ATTACHMENTS`
+/// because some Android GLES 3.0 drivers advertise more draw buffers than the framebuffer
+/// has colour-attachment slots for; exceeding the attachment limit leaves the framebuffer
+/// in `GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT` (0x8CD6) instead of failing cleanly.
+#[no_mangle]
+pub unsafe extern "C" fn glDrawBuffers(n: i32, b: *const u32) {
+    if n < 0 || (n > 0 && b.is_null()) {
+        errors().set(GL_INVALID_VALUE);
+        return;
+    }
+    let caps = gles3::caps();
+    let max = if caps.valid {
+        caps.max_draw_buffers.min(caps.max_color_attachments).max(0)
+    } else {
+        caps.max_draw_buffers
+    };
+    let mut n = n;
+    if max > 0 && n > max {
+        static ONCE: AtomicBool = AtomicBool::new(false);
+        if !ONCE.swap(true, Ordering::Relaxed) {
+            log(&format!(
+                "[GLCompat] glDrawBuffers: device supports {max} draw/color buffers, \
+                 clamping the requested {n} (shader pack declares more layers than the GPU has)"
+            ));
+        }
+        n = max;
+    }
+    let mapped_modes = if shader_translation_is_es() && n > 0 {
+        let needs_mapping = (0..n as usize)
+            .any(|i| needs_default_framebuffer_buffer_remap(*b.add(i)));
+        if needs_mapping {
+            current_framebuffer_binding(GL_DRAW_FRAMEBUFFER_BINDING)
+                .filter(|binding| *binding == 0)
+                .map(|_| {
+                    (0..n as usize)
+                        .map(|i| map_default_framebuffer_buffer(*b.add(i), true, 0))
+                        .collect::<Vec<_>>()
+                })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    match driver_fn_cached::<unsafe extern "C" fn(i32, *const u32)>("glDrawBuffers") {
+        Some(g) => g(n, mapped_modes.as_ref().map_or(b, |modes| modes.as_ptr())),
+        None => errors().set(GL_INVALID_OPERATION),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn glDrawBuffer(mode: u32) {
+    let mode = remap_default_framebuffer_buffer(mode, GL_DRAW_FRAMEBUFFER_BINDING);
+    match driver_fn_cached::<unsafe extern "C" fn(i32, *const u32)>("glDrawBuffers") {
+        Some(g) => g(1, &mode),
+        None => errors().set(GL_INVALID_OPERATION),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn glReadBuffer(mode: u32) {
+    trace_call("glReadBuffer");
+    let mode = remap_default_framebuffer_buffer(mode, GL_READ_FRAMEBUFFER_BINDING);
+    match driver_fn_cached::<unsafe extern "C" fn(u32)>("glReadBuffer") {
+        Some(f) => f(mode),
+        None => errors().set(GL_INVALID_OPERATION),
+    }
+}
+
+/// Desktop `glMapBuffer` -> ES `glMapBufferRange` over the whole buffer.
+#[no_mangle]
+pub unsafe extern "C" fn glMapBuffer(target: u32, access: u32) -> *mut c_void {
+    let bits = match format_translate::map_access(access) {
+        Some(b) => b,
+        None => {
+            errors().set(0x0500); // GL_INVALID_ENUM
+            return std::ptr::null_mut();
+        }
+    };
+    let get = driver_fn_cached::<unsafe extern "C" fn(u32, u32, *mut i32)>("glGetBufferParameteriv");
+    let map = driver_fn_cached::<unsafe extern "C" fn(u32, isize, isize, u32) -> *mut c_void>("glMapBufferRange");
+    match (get, map) {
+        (Some(g), Some(m)) => {
+            let mut size = 0i32;
+            g(target, 0x8764, &mut size); // GL_BUFFER_SIZE
+            if size <= 0 {
+                errors().set(GL_INVALID_OPERATION);
+                return std::ptr::null_mut();
+            }
+            m(target, 0, size as isize, bits)
+        }
+        _ => {
+            errors().set(GL_INVALID_OPERATION);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// ES has no polygon mode. FILL is the ES behavior (no-op); anything else is reported.
+#[no_mangle]
+pub extern "C" fn glPolygonMode(_face: u32, mode: u32) {
+    if mode != 0x1B02 {
+        log("[GLCompat] Unsupported operation: glPolygonMode(LINE/POINT)\n  Reason: not available in GLES\n  Fallback: none");
+        errors().set(GL_INVALID_OPERATION);
+    }
+}
+
+/// Functions whose GLES 3.0 signature and behavior match desktop GL closely enough to forward.
+/// Format/enum differences (e.g. BGRA, legacy internal formats) are NOT translated yet;
+/// the driver's own error is surfaced via glGetError.
+macro_rules! forward_all {
+    ($( $name:ident ( $($a:ident : $t:ty),* ) $(-> $r:ty)? ; )*) => {
+        $(
+            #[no_mangle]
+            pub unsafe extern "C" fn $name($($a: $t),*) $(-> $r)? {
+                type F = unsafe extern "C" fn($($t),*) $(-> $r)?;
+                trace_call(stringify!($name));
+                match driver_fn_cached::<F>(stringify!($name)) {
+                    Some(f) => f($($a),*),
+                    None => {
+                        errors().set(GL_INVALID_OPERATION);
+                        Default::default()
+                    }
+                }
+            }
+        )*
+        fn forwarded(name: &[u8]) -> *const c_void {
+            $( if name == stringify!($name).as_bytes() { return $name as *const c_void; } )*
+            std::ptr::null()
+        }
+    };
+}
+
+forward_all! {
+    glAttachShader(p: u32, s: u32);
+    glBindAttribLocation(p: u32, i: u32, n: *const c_char);
+    glBindFramebuffer(t: u32, f: u32);
+    glBindRenderbuffer(t: u32, r: u32);
+    glBindVertexArray(a: u32);
+    glBlendColor(r: f32, g: f32, b: f32, a: f32);
+    glBlendEquation(m: u32);
+    glBlendEquationSeparate(a: u32, b: u32);
+    glBlendFunc(s: u32, d: u32);
+    glBlendFuncSeparate(a: u32, b: u32, c: u32, d: u32);
+    glClearStencil(s: i32);
+    glColorMask(r: u8, g: u8, b: u8, a: u8);
+    glCullFace(m: u32);
+    glDeleteFramebuffers(n: i32, f: *const u32);
+    glDeleteRenderbuffers(n: i32, r: *const u32);
+    glDeleteShader(s: u32);
+    glDeleteTextures(n: i32, t: *const u32);
+    glDeleteVertexArrays(n: i32, a: *const u32);
+    glDepthFunc(f: u32);
+    glDepthMask(m: u8);
+    glDetachShader(p: u32, s: u32);
+    glDisableVertexAttribArray(i: u32);
+    glDrawElements(m: u32, c: i32, t: u32, i: *const c_void);
+    glEnableVertexAttribArray(i: u32);
+    glFinish();
+    glFlush();
+    glFramebufferRenderbuffer(t: u32, a: u32, rt: u32, r: u32);
+    glFrontFace(m: u32);
+    glGenBuffers(n: i32, b: *mut u32);
+    glGenFramebuffers(n: i32, f: *mut u32);
+    glGenRenderbuffers(n: i32, r: *mut u32);
+    glGenTextures(n: i32, t: *mut u32);
+    glGenVertexArrays(n: i32, a: *mut u32);
+    glGenerateMipmap(t: u32);
+    glGetAttribLocation(p: u32, n: *const c_char) -> i32;
+    glGetProgramInfoLog(p: u32, b: i32, l: *mut i32, log: *mut c_char);
+    glGetShaderInfoLog(s: u32, b: i32, l: *mut i32, log: *mut c_char);
+    glGetUniformLocation(p: u32, n: *const c_char) -> i32;
+    glIsEnabled(c: u32) -> u8;
+    glPolygonOffset(f: f32, u: f32);
+    glReadPixels(x: i32, y: i32, w: i32, h: i32, f: u32, t: u32, d: *mut c_void);
+    glScissor(x: i32, y: i32, w: i32, h: i32);
+    glStencilFunc(f: u32, r: i32, m: u32);
+    glStencilMask(m: u32);
+    glStencilOp(a: u32, b: u32, c: u32);
+    glTexImage3D(t: u32, l: i32, ifmt: i32, w: i32, h: i32, dp: i32, b: i32, f: u32, ty: u32, d: *const c_void);
+    glUniform1f(l: i32, a: f32);
+    glUniform2f(l: i32, a: f32, b: f32);
+    glUniform3f(l: i32, a: f32, b: f32, c: f32);
+    glUniform4f(l: i32, a: f32, b: f32, c: f32, d: f32);
+    glUniform1i(l: i32, a: i32);
+    glUniform2i(l: i32, a: i32, b: i32);
+    glUniform3i(l: i32, a: i32, b: i32, c: i32);
+    glUniform4i(l: i32, a: i32, b: i32, c: i32, d: i32);
+    glUniform1fv(l: i32, n: i32, v: *const f32);
+    glUniform2fv(l: i32, n: i32, v: *const f32);
+    glUniform3fv(l: i32, n: i32, v: *const f32);
+    glUniform4fv(l: i32, n: i32, v: *const f32);
+    glUniform1iv(l: i32, n: i32, v: *const i32);
+    glUniformMatrix2fv(l: i32, n: i32, t: u8, v: *const f32);
+    glUniformMatrix3fv(l: i32, n: i32, t: u8, v: *const f32);
+    glUniformMatrix4fv(l: i32, n: i32, t: u8, v: *const f32);
+    glVertexAttribPointer(i: u32, s: i32, t: u32, n: u8, st: i32, p: *const c_void);
+    glVertexAttribIPointer(i: u32, s: i32, t: u32, st: i32, p: *const c_void);
+    glUnmapBuffer(t: u32) -> u8;
+    // --- additional ES 3.0 / desktop-common entry points ---
+    glMapBufferRange(t: u32, o: isize, l: isize, a: u32) -> *mut c_void;
+    glFlushMappedBufferRange(t: u32, o: isize, l: isize);
+    glCopyBufferSubData(r: u32, w: u32, ro: isize, wo: isize, s: isize);
+    glCopyImageSubData(src_name: u32, src_target: u32, src_level: i32, src_x: i32, src_y: i32, src_z: i32,
+                       dst_name: u32, dst_target: u32, dst_level: i32, dst_x: i32, dst_y: i32, dst_z: i32,
+                       width: i32, height: i32, depth: i32);
+    glGetBufferParameteriv(t: u32, n: u32, v: *mut i32);
+    glTexSubImage3D(t: u32, l: i32, x: i32, y: i32, z: i32, w: i32, h: i32, d: i32, f: u32, ty: u32, data: *const c_void);
+    glCompressedTexImage2D(t: u32, l: i32, ifmt: u32, w: i32, h: i32, b: i32, size: i32, data: *const c_void);
+    glCompressedTexSubImage2D(t: u32, l: i32, x: i32, y: i32, w: i32, h: i32, f: u32, size: i32, data: *const c_void);
+    glCopyTexImage2D(t: u32, l: i32, ifmt: u32, x: i32, y: i32, w: i32, h: i32, b: i32);
+    glCopyTexSubImage2D(t: u32, l: i32, x: i32, y: i32, sx: i32, sy: i32, w: i32, h: i32);
+    glGetTexParameteriv(t: u32, n: u32, v: *mut i32);
+    glGetTexParameterfv(t: u32, n: u32, v: *mut f32);
+    glGetActiveUniform(p: u32, i: u32, buf: i32, len: *mut i32, size: *mut i32, ty: *mut u32, name: *mut c_char);
+    glGetActiveAttrib(p: u32, i: u32, buf: i32, len: *mut i32, size: *mut i32, ty: *mut u32, name: *mut c_char);
+    glGetAttachedShaders(p: u32, max: i32, count: *mut i32, shaders: *mut u32);
+    glGetFramebufferAttachmentParameteriv(t: u32, a: u32, n: u32, v: *mut i32);
+    glGetRenderbufferParameteriv(t: u32, n: u32, v: *mut i32);
+    glGetShaderSource(s: u32, buf: i32, len: *mut i32, src: *mut c_char);
+    glGetVertexAttribiv(i: u32, n: u32, v: *mut i32);
+    glGetVertexAttribfv(i: u32, n: u32, v: *mut f32);
+    glGetVertexAttribPointerv(i: u32, n: u32, p: *mut *mut c_void);
+    glIsBuffer(b: u32) -> u8;
+    glIsFramebuffer(f: u32) -> u8;
+    glIsProgram(p: u32) -> u8;
+    glIsRenderbuffer(r: u32) -> u8;
+    glIsShader(s: u32) -> u8;
+    glIsTexture(t: u32) -> u8;
+    glIsVertexArray(a: u32) -> u8;
+    glLineWidth(w: f32);
+    glSampleCoverage(v: f32, invert: u8);
+    glStencilFuncSeparate(face: u32, f: u32, r: i32, m: u32);
+    glStencilMaskSeparate(face: u32, m: u32);
+    glStencilOpSeparate(face: u32, a: u32, b: u32, c: u32);
+    glHint(t: u32, m: u32);
+    glInvalidateFramebuffer(t: u32, n: i32, attachments: *const u32);
+    glInvalidateSubFramebuffer(t: u32, n: i32, attachments: *const u32, x: i32, y: i32, w: i32, h: i32);
+    glVertexAttrib1f(i: u32, x: f32);
+    glVertexAttrib2f(i: u32, x: f32, y: f32);
+    glVertexAttrib3f(i: u32, x: f32, y: f32, z: f32);
+    glVertexAttrib4f(i: u32, x: f32, y: f32, z: f32, w: f32);
+    glVertexAttrib4Nub(i: u32, x: u8, y: u8, z: u8, w: u8);
+    glClearDepthf(d: f32);
+    glDepthRangef(n: f32, f: f32);
+    glGetProgramBinary(p: u32, buf: i32, len: *mut i32, format: *mut u32, binary: *mut c_void);
+    glProgramBinary(p: u32, format: u32, binary: *const c_void, len: i32);
+    glProgramParameteri(p: u32, n: u32, v: i32);
+    glValidateProgram(p: u32);
+    glGetUniformfv(p: u32, loc: i32, v: *mut f32);
+    glGetUniformiv(p: u32, loc: i32, v: *mut i32);
+    glTransformFeedbackVaryings(p: u32, count: i32, varyings: *const *const c_char, buffer_mode: u32);
+    glBindTransformFeedback(t: u32, id: u32);
+    glGenTransformFeedbacks(n: i32, ids: *mut u32);
+    glDeleteTransformFeedbacks(n: i32, ids: *const u32);
+    glIsTransformFeedback(id: u32) -> u8;
+    glVertexAttribI4i(i: u32, x: i32, y: i32, z: i32, w: i32);
+    glVertexAttribI4ui(i: u32, x: u32, y: u32, z: u32, w: u32);
+    glUniform1uiv(l: i32, n: i32, v: *const u32);
+    glUniform2uiv(l: i32, n: i32, v: *const u32);
+    glUniform3uiv(l: i32, n: i32, v: *const u32);
+    glUniform4uiv(l: i32, n: i32, v: *const u32);
+    glUniform1ui(l: i32, a: u32);
+    glUniform2ui(l: i32, a: u32, b: u32);
+    glUniform3ui(l: i32, a: u32, b: u32, c: u32);
+    glUniform4ui(l: i32, a: u32, b: u32, c: u32, d: u32);
+    glGetFragDataLocation(p: u32, name: *const c_char) -> i32;
+    glPrimitiveRestartIndex(index: u32);
+    glBindFragDataLocationIndexed(program: u32, colorNumber: u32, index: u32, name: *const c_char);
+    glColorMaski(buf: u32, r: u8, g: u8, b: u8, a: u8);
+    glEnablei(cap: u32, index: u32);
+    glDisablei(cap: u32, index: u32);
+    glBlendEquationi(buf: u32, mode: u32);
+    glBlendEquationSeparatei(buf: u32, modeRGB: u32, modeAlpha: u32);
+    glBlendFunci(buf: u32, src: u32, dst: u32);
+    glBlendFuncSeparatei(buf: u32, srcRGB: u32, dstRGB: u32, srcAlpha: u32, dstAlpha: u32);
+    glGetUniformuiv(program: u32, location: i32, params: *mut u32);
+    glTexParameterIiv(target: u32, pname: u32, params: *const i32);
+    glTexParameterIuiv(target: u32, pname: u32, params: *const u32);
+    glGetTexParameterIiv(target: u32, pname: u32, params: *mut i32);
+    glGetTexParameterIuiv(target: u32, pname: u32, params: *mut u32);
+    glVertexAttribP4ui(index: u32, ty: u32, normalized: u8, value: u32);
+    glVertexAttribP3ui(index: u32, ty: u32, normalized: u8, value: u32);
+    glVertexAttribP2ui(index: u32, ty: u32, normalized: u8, value: u32);
+    glVertexAttribP1ui(index: u32, ty: u32, normalized: u8, value: u32);
+    glDrawArraysIndirect(mode: u32, indirect: *const c_void);
+    glDrawElementsIndirect(mode: u32, ty: u32, indirect: *const c_void);
+    glUniformMatrix2x3fv(loc: i32, count: i32, transpose: u8, value: *const f32);
+    glUniformMatrix3x2fv(loc: i32, count: i32, transpose: u8, value: *const f32);
+    glUniformMatrix2x4fv(loc: i32, count: i32, transpose: u8, value: *const f32);
+    glUniformMatrix4x2fv(loc: i32, count: i32, transpose: u8, value: *const f32);
+    glUniformMatrix3x4fv(loc: i32, count: i32, transpose: u8, value: *const f32);
+    glUniformMatrix4x3fv(loc: i32, count: i32, transpose: u8, value: *const f32);
+    // --- GL 3.0-3.3 entry points whose ABI GLES 3.x already matches exactly ---
+    // Buffer read-back / query (Minecraft reads VBO contents; the PBO path needs these).
+    glGetBufferSubData(target: u32, offset: isize, size: isize, data: *mut c_void);
+    glGetBufferPointerv(target: u32, pname: u32, params: *mut *mut c_void);
+    // Texture targets/queries.
+    glGetTexLevelParameterfv(target: u32, level: i32, pname: u32, params: *mut f32);
+    glCompressedTexImage3D(t: u32, l: i32, ifmt: u32, w: i32, h: i32, d: i32, b: i32, size: i32, data: *const c_void);
+    glCompressedTexSubImage3D(t: u32, l: i32, x: i32, y: i32, z: i32, w: i32, h: i32, d: i32, ifmt: u32, size: i32, data: *const c_void);
+    glCopyTexSubImage3D(t: u32, l: i32, xoff: i32, yoff: i32, zoff: i32, x: i32, y: i32, w: i32, h: i32);
+    glGetCompressedTexImage(t: u32, l: i32, format: u32, size: i32, data: *mut c_void);
+    // Multisample textures (GL 3.2 / ARB_multisampled_textures).
+    glTexImage2DMultisample(t: u32, samples: i32, ifmt: u32, w: i32, h: i32, fixed: u8);
+    glTexImage3DMultisample(t: u32, samples: i32, ifmt: u32, w: i32, h: i32, d: i32, fixed: u8);
+    glGetMultisamplefv(pname: u32, index: u32, data: *mut f32);
+    // Layered framebuffer attachments without an explicit layer (GL 3.1).
+    glFramebufferTexture(t: u32, a: u32, tex: u32, l: i32);
+    // Generic vertex attributes: the scalar/vector integer setters.
+    glVertexAttribI2i(i: u32, x: i32, y: i32);
+    glVertexAttribI2iv(i: u32, v: *const i32);
+    glVertexAttribI2ui(i: u32, x: u32, y: u32);
+    glVertexAttribI2uiv(i: u32, v: *const u32);
+    glVertexAttribI3i(i: u32, x: i32, y: i32, z: i32);
+    glVertexAttribI3iv(i: u32, v: *const i32);
+    glVertexAttribI3ui(i: u32, x: u32, y: u32, z: u32);
+    glVertexAttribI3uiv(i: u32, v: *const u32);
+    glVertexAttribI4iv(i: u32, v: *const i32);
+    glVertexAttribI4uiv(i: u32, v: *const u32);
+    // Per-draw-buffer state queries.
+    glIsEnabledi(cap: u32, index: u32) -> u8;
+    glGetBooleani_v(pname: u32, index: u32, data: *mut u8);
+}
+
+
+/// Symbol lookup used by LWJGL/GLFW-style loaders (`glXGetProcAddress` flavour).
+/// Returns null for anything unimplemented -- never a stub that pretends to work.
+
+#[no_mangle]
+pub unsafe extern "C" fn glDrawArrays(mode: u32, first: i32, count: i32) {
+    // Fixed-function draw (no shader program bound): emulate with our own program.
+    if fixed_draw::try_draw_arrays(mode, first, count) {
+        return;
+    }
+    let mode = fixed_func::map_draw_mode(mode);
+    type F = unsafe extern "C" fn(u32, i32, i32);
+    match driver_fn_cached::<F>("glDrawArrays") {
+        Some(f) => f(mode, first, count),
+        None => errors().set(GL_INVALID_OPERATION),
+    }
+}
+
+
+/// Fixed-pipeline / 1.x symbols LWJGL enumerates. The immediate-mode subset is emulated by
+/// ff_draw, so most of these are only reached when no program is bound; the remainder
+/// genuinely have no ES equivalent.
+///
+/// Shared with the reachability test, which walks it to prove no exported name resolves to the
+/// shared no-op instead of its implementation.
+static LEGACY_NAMES: &[&[u8]] = &[
+        b"glAccum", b"glAlphaFunc", b"glAreTexturesResident",
+        b"glBegin", b"glBitmap", b"glCallList", b"glCallLists", b"glClearAccum",
+        b"glClearIndex", b"glClipPlane", b"glColor3b", b"glColor3bv", b"glColor3d",
+        b"glColor3dv", b"glColor3f", b"glColor3fv", b"glColor3i", b"glColor3iv",
+        b"glColor3s", b"glColor3sv", b"glColor3ub", b"glColor3ubv", b"glColor3ui",
+        b"glColor3uiv", b"glColor3us", b"glColor3usv", b"glColor4b", b"glColor4bv",
+        b"glColor4d", b"glColor4dv", b"glColor4fv", b"glColor4i", b"glColor4iv",
+        b"glColor4s", b"glColor4sv", b"glColor4ub", b"glColor4ubv", b"glColor4ui",
+        b"glColor4uiv", b"glColor4us", b"glColor4usv", b"glColorMaterial",
+ b"glCopyPixels", b"glDeleteLists", b"glDrawPixels",
+        b"glEdgeFlag", b"glEdgeFlagPointer", b"glEdgeFlagv", b"glEnd",
+        b"glEndList", b"glEvalCoord1d", b"glEvalCoord1dv", b"glEvalCoord1f",
+        b"glEvalCoord1fv", b"glEvalCoord2d", b"glEvalCoord2dv", b"glEvalCoord2f",
+        b"glEvalCoord2fv", b"glEvalMesh1", b"glEvalMesh2", b"glEvalPoint1",
+        b"glEvalPoint2", b"glFeedbackBuffer", b"glFogf", b"glFogfv", b"glFogi",
+        b"glFogiv", b"glFrustum", b"glGenLists", b"glGetClipPlane", b"glGetLightfv",
+        b"glGetLightiv", b"glGetMapdv", b"glGetMapfv", b"glGetMapiv", b"glGetMaterialfv",
+        b"glGetMaterialiv", b"glGetPixelMapfv", b"glGetPixelMapuiv", b"glGetPixelMapusv",
+        b"glGetPolygonStipple", b"glGetTexEnvfv", b"glGetTexEnviv", b"glGetTexGendv",
+        b"glGetTexGenfv", b"glGetTexGeniv", b"glIndexMask", b"glIndexPointer",
+        b"glIndexd", b"glIndexdv", b"glIndexf", b"glIndexfv", b"glIndexi", b"glIndexiv",
+        b"glIndexs", b"glIndexsv", b"glIndexub", b"glIndexubv", b"glInitNames",
+        b"glInterleavedArrays", b"glIsList", b"glIsTextureEXT", b"glLightModelf",
+        b"glLightModelfv", b"glLightModeli", b"glLightModeliv", b"glLightf",
+        b"glLightfv", b"glLighti", b"glLightiv", b"glLineStipple", b"glListBase",
+ b"glLoadMatrixd", b"glLoadMatrixf", b"glLoadName",
+        b"glLoadTransposeMatrixd", b"glLoadTransposeMatrixf", b"glMap1d", b"glMap1f",
+        b"glMap2d", b"glMap2f", b"glMapGrid1d", b"glMapGrid1f", b"glMapGrid2d",
+        b"glMapGrid2f", b"glMaterialf", b"glMaterialfv", b"glMateriali", b"glMaterialiv",
+ b"glMultMatrixd", b"glMultMatrixf", b"glMultTransposeMatrixd",
+        b"glMultTransposeMatrixf", b"glNewList", b"glNormal3b", b"glNormal3bv",
+        b"glNormal3d", b"glNormal3dv", b"glNormal3f", b"glNormal3fv", b"glNormal3i",
+        b"glNormal3iv", b"glNormal3s", b"glNormal3sv", b"glNormalPointer",
+ b"glPassThrough", b"glPixelMapfv", b"glPixelMapuiv", b"glPixelMapusv",
+        b"glPixelTransferf", b"glPixelTransferi", b"glPixelZoom", b"glPolygonMode",
+        b"glPolygonStipple", b"glPopAttrib", b"glPopClientAttrib", b"glPopMatrix",
+        b"glPopName", b"glPrioritizeTextures", b"glPushAttrib", b"glPushClientAttrib",
+ b"glPushName", b"glRasterPos2d", b"glRasterPos2dv",
+        b"glRasterPos2f", b"glRasterPos2fv", b"glRasterPos2i", b"glRasterPos2iv",
+        b"glRasterPos2s", b"glRasterPos2sv", b"glRasterPos3d", b"glRasterPos3dv",
+        b"glRasterPos3f", b"glRasterPos3fv", b"glRasterPos3i", b"glRasterPos3iv",
+        b"glRasterPos3s", b"glRasterPos3sv", b"glRasterPos4d", b"glRasterPos4dv",
+        b"glRasterPos4f", b"glRasterPos4fv", b"glRasterPos4i", b"glRasterPos4iv",
+        b"glRasterPos4s", b"glRasterPos4sv", b"glRectd", b"glRectdv", b"glRectf",
+        b"glRectfv", b"glRecti", b"glRectiv", b"glRects", b"glRectsv", b"glRenderMode",
+        b"glRotated", b"glRotatef", b"glScaled", b"glScalef", b"glSelectBuffer",
+ b"glTexCoord1d", b"glTexCoord1dv", b"glTexCoord1f",
+        b"glTexCoord1fv", b"glTexCoord1i", b"glTexCoord1iv", b"glTexCoord1s",
+        b"glTexCoord1sv", b"glTexCoord2d", b"glTexCoord2dv", b"glTexCoord2f",
+        b"glTexCoord2fv", b"glTexCoord2i", b"glTexCoord2iv", b"glTexCoord2s",
+        b"glTexCoord2sv", b"glTexCoord3d", b"glTexCoord3dv", b"glTexCoord3f",
+        b"glTexCoord3fv", b"glTexCoord3i", b"glTexCoord3iv", b"glTexCoord3s",
+        b"glTexCoord3sv", b"glTexCoord4d", b"glTexCoord4dv", b"glTexCoord4f",
+        b"glTexCoord4fv", b"glTexCoord4i", b"glTexCoord4iv", b"glTexCoord4s",
+        b"glTexCoord4sv", b"glTexCoordPointer", b"glTexEnvf", b"glTexEnvfv",
+ b"glTexEnviv", b"glTexGend", b"glTexGendv", b"glTexGenf",
+        b"glTexGenfv", b"glTexGeni", b"glTexGeniv", b"glTranslated", b"glTranslatef",
+        b"glVertex2d", b"glVertex2dv", b"glVertex2f", b"glVertex2fv", b"glVertex2i",
+        b"glVertex2iv", b"glVertex2s", b"glVertex2sv", b"glVertex3d", b"glVertex3dv",
+        b"glVertex3f", b"glVertex3fv", b"glVertex3i", b"glVertex3iv", b"glVertex3s",
+        b"glVertex3sv", b"glVertex4d", b"glVertex4dv", b"glVertex4f", b"glVertex4fv",
+        b"glVertex4i", b"glVertex4iv", b"glVertex4s", b"glVertex4sv", b"glVertexPointer",
+        b"glWindowPos2d", b"glWindowPos2dv", b"glWindowPos2f", b"glWindowPos2fv",
+        b"glWindowPos2i", b"glWindowPos2iv", b"glWindowPos2s", b"glWindowPos2sv",
+        b"glWindowPos3d", b"glWindowPos3dv", b"glWindowPos3f", b"glWindowPos3fv",
+        b"glWindowPos3i", b"glWindowPos3iv", b"glWindowPos3s", b"glWindowPos3sv",
+];
+
+fn resolve_legacy_stub(n: &[u8]) -> *const c_void {
+    // Resolving to a callable stub keeps the process alive, but a *silent* stub is worse than
+    // an error: a caller that depends on the behaviour gets nothing and no clue. So the first
+    // resolution of each name is logged.
+    // Our own export wins over everything below: if this layer defines the name, the real
+    // implementation is the answer, never the shared stub. This is what keeps the resolver
+    // honest -- a measured audit found 127 exported symbols being served as the stub and 89
+    // unreachable through getProcAddress, among them glBegin, glVertex3f and the glColor*
+    // family, which is the fixed-function path the game draws through.
+    if let Some(p) = own_symbol(n) {
+        return p;
+    }
+    for s in LEGACY_NAMES {
+        if n == *s {
+            return legacy_noop_fn as *const c_void;
+        }
+    }
+    std::ptr::null()
+}
+
+/// The shared fallback for a GL name this layer does not implement.
+///
+/// It used to return quietly, which is the worst option available: the call succeeds, the
+/// game carries on believing the state changed, and the resulting image is wrong with nothing
+/// anywhere pointing at a cause. Raising `GL_INVALID_OPERATION` makes the game able to see it.
+/// It is not the *right* fix -- that would be implementing the call -- but it is the difference
+/// between a silent wrong frame and a diagnosable one.
+#[inline(never)]
+pub unsafe extern "C" fn legacy_noop_fn() {
+    errors().set(0x0502 /* GL_INVALID_OPERATION */);
+}
+
+// ---- core GL 1.x-3.3 entry points that used to resolve to NULL --------------------------------
+// LWJGL resolves every GL11..GL33 function at startup. With `-Dorg.lwjgl.util.NoChecks=true`
+// a NULL pointer is *called* instead of rejected, which is the `SIGSEGV pc=0x0` the 1.16.5
+// OptiFine launch died with. Everything below resolves to something callable.
+
+/// Answers fog queries from the recorded state, then falls through to the driver. ES 3.x has
+/// no fog, so forwarding these pnames raises GL_INVALID_ENUM and leaves the game's cached fog
+/// state disagreeing with what it last set.
+#[no_mangle]
+pub unsafe extern "C" fn glGetFloatv(p: u32, d: *mut f32) {
+    if d.is_null() {
+        errors().set(GL_INVALID_VALUE);
+        return;
+    }
+    if let Some(matrix) = fixed_func::matrix_for_pname(p) {
+        std::ptr::copy_nonoverlapping(matrix.as_ptr(), d, matrix.len());
+        return;
+    }
+    if let Some(v) = fixed_func::fog_query_f(p) {
+        *d = v;
+        return;
+    }
+    let p = remap_draw_buffer_query_pname(p);
+    match driver_fn_cached::<unsafe extern "C" fn(u32, *mut f32)>("glGetFloatv") {
+        Some(f) => f(p, d),
+        None => errors().set(GL_INVALID_OPERATION),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn glGetBooleanv(p: u32, d: *mut u8) {
+    trace_call("glGetBooleanv");
+    if d.is_null() {
+        errors().set(GL_INVALID_VALUE);
+        return;
+    }
+    let p = remap_draw_buffer_query_pname(p);
+    match driver_fn_cached::<unsafe extern "C" fn(u32, *mut u8)>("glGetBooleanv") {
+        Some(f) => f(p, d),
+        None => errors().set(GL_INVALID_OPERATION),
+    }
+}
+
+/// Desktop `glGetDoublev` -> ES `glGetFloatv`, widened. Matrices come from the emulated
+/// fixed-function stack. Unknown pnames write one value (the safest count for the caller).
+#[no_mangle]
+pub unsafe extern "C" fn glGetDoublev(pname: u32, data: *mut f64) {
+    if data.is_null() {
+        errors().set(GL_INVALID_VALUE);
+        return;
+    }
+    if let Some(m) = fixed_func::matrix_for_pname(pname) {
+        for (i, v) in m.iter().enumerate() {
+            *data.add(i) = *v as f64;
+        }
+        return;
+    }
+    let count = match pname {
+        0x0BA8 => 16,                       // GL_TEXTURE_MATRIX
+        0x0B70 | 0x0B21 | 0x0B12 | 0x0B22 => 2, // DEPTH_RANGE, LINE_WIDTH range/point size range
+        0x0C22 | 0x0B13 | 0x0B03 | 0x0BA2 | 0x0C23 => 4, // CLEAR_COLOR, VIEWPORT, ...
+        _ => 1,
+    };
+    let pname = remap_draw_buffer_query_pname(pname);
+    let mut tmp = [0f32; 16];
+    if let Some(f) = driver_fn_cached::<unsafe extern "C" fn(u32, *mut f32)>("glGetFloatv") {
+        f(pname, tmp.as_mut_ptr());
+    }
+    for i in 0..count {
+        *data.add(i) = tmp[i] as f64;
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn glPixelStoref(pname: u32, param: f32) {
+    glPixelStorei(pname, param as i32);
+}
+
+/// Desktop-only core calls with no GLES 3.0 equivalent. They are accepted, logged once, and
+/// raise nothing, so a mod that probes them keeps running instead of dying in native code.
+pub unsafe extern "C" fn core_unsupported_noop() -> usize {
+    static ONCE: AtomicBool = AtomicBool::new(false);
+    if !ONCE.swap(true, Ordering::Relaxed) {
+        log("[GLCompat] a desktop-only core GL call (1D textures / double attribs / conditional render) was made and ignored");
+    }
+    0
+}
+
+const CORE_UNSUPPORTED: &[&[u8]] = &[
+    b"glTexImage1D", b"glCopyTexImage1D", b"glCopyTexSubImage1D",
+    b"glCompressedTexImage1D", b"glCompressedTexSubImage1D",
+    b"glPointParameteri", b"glPointParameteriv",
+    b"glVertexAttrib1s", b"glVertexAttrib1d", b"glVertexAttrib2s", b"glVertexAttrib2d",
+    b"glVertexAttrib3s", b"glVertexAttrib3d", b"glVertexAttrib4s", b"glVertexAttrib4d",
+    b"glVertexAttrib1sv", b"glVertexAttrib1dv", b"glVertexAttrib2sv", b"glVertexAttrib2dv",
+    b"glVertexAttrib3sv", b"glVertexAttrib3dv", b"glVertexAttrib4sv", b"glVertexAttrib4dv",
+    b"glVertexAttrib4iv", b"glVertexAttrib4bv", b"glVertexAttrib4ubv", b"glVertexAttrib4usv",
+    b"glVertexAttrib4uiv", b"glVertexAttrib4Nbv", b"glVertexAttrib4Nsv", b"glVertexAttrib4Niv",
+    b"glVertexAttrib4Nubv", b"glVertexAttrib4Nusv", b"glVertexAttrib4Nuiv",
+    b"glGetVertexAttribdv",
+    b"glVertexAttribI1i", b"glVertexAttribI1ui", b"glVertexAttribI1iv", b"glVertexAttribI1uiv",
+    b"glVertexAttribI4bv", b"glVertexAttribI4sv", b"glVertexAttribI4ubv", b"glVertexAttribI4usv",
+    b"glBeginConditionalRender", b"glEndConditionalRender",
+    b"glFramebufferTexture1D", b"glFramebufferTexture3D",
+    b"glMultiDrawElementsBaseVertex",
+];
+
+fn resolve_core_unsupported(n: &[u8]) -> *const c_void {
+    if CORE_UNSUPPORTED.iter().any(|s| *s == n) {
+        core_unsupported_noop as *const c_void
+    } else {
+        std::ptr::null()
+    }
+}
+
+// ---- immutable buffer storage (GL 4.4 / ARB_buffer_storage) --------------------------------
+
+/// The buffer *binding* enum for a target, when it differs from the target enum itself.
+/// Pure so the table can be unit tested without a context.
+fn buffer_binding_pname(target: u32) -> Option<u32> {
+    const PAIRS: &[(u32, u32)] = &[
+        (0x8892, 0x8894), // GL_ARRAY_BUFFER
+        (0x8893, 0x8895), // GL_ELEMENT_ARRAY_BUFFER
+        (0x8A11, 0x8A28), // GL_UNIFORM_BUFFER
+        (0x90D2, 0x90D3), // GL_SHADER_STORAGE_BUFFER
+        (0x8C8E, 0x8C8F), // GL_TRANSFORM_FEEDBACK_BUFFER
+        (0x8F36, 0x8F36), // GL_COPY_READ_BUFFER (binding shares the target enum)
+        (0x8F37, 0x8F37), // GL_COPY_WRITE_BUFFER
+    ];
+    PAIRS.iter().find(|(t, _)| *t == target).map(|(_, b)| *b)
+}
+
+/// Name currently bound to `target`, or 0 when the target is unknown or nothing is bound.
+unsafe fn bound_buffer_name(target: u32) -> u32 {
+    let Some(pname) = buffer_binding_pname(target) else {
+        return 0;
+    };
+    let mut v = 0i32;
+    if let Some(get) = driver_fn_cached::<GetIntFn>("glGetIntegerv") {
+        get(pname, &mut v);
+    }
+    v.max(0) as u32
+}
+
+/// Usage hint for the `glBufferData` fallback: `GL_DYNAMIC_STORAGE_BIT` asks for a
+/// dynamically-updated buffer, anything else is static.
+fn storage_usage(flags: u32) -> u32 {
+    const GL_DYNAMIC_STORAGE_BIT: u32 = 0x0100;
+    const GL_STATIC_DRAW: u32 = 0x88E4;
+    const GL_DYNAMIC_DRAW: u32 = 0x88E8;
+    if flags & GL_DYNAMIC_STORAGE_BIT != 0 {
+        GL_DYNAMIC_DRAW
+    } else {
+        GL_STATIC_DRAW
+    }
+}
+
+/// Buffer IDs and immutable storage flags. DYNAMIC_STORAGE_BIT allows subdata
+/// updates but never allows reallocating the store with glBufferData.
+static IMMUTABLE_BUFFERS: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
+
+fn with_immutable<R>(f: impl FnOnce(&mut Vec<(u32, u32)>) -> R) -> R {
+    let mut g = IMMUTABLE_BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
+    f(g.as_mut())
+}
+
+fn mark_immutable(buffer: u32, flags: u32) {
+    if buffer != 0 {
+        with_immutable(|v| {
+            v.retain(|(id, _)| *id != buffer);
+            v.push((buffer, flags));
+        });
+    }
+}
+
+fn is_immutable(buffer: u32) -> bool {
+    with_immutable(|v| v.iter().any(|(id, _)| *id == buffer))
+}
+
+fn immutable_allows_subdata(buffer: u32) -> bool {
+    with_immutable(|v| v.iter().find(|(id, _)| *id == buffer)
+        .map_or(true, |(_, flags)| flags & 0x0100 != 0))
+}
+
+/// `glBufferStorage` -> EXT_buffer_storage when advertised, otherwise a
+/// `glBufferData` with the closest usage hint. The fallback cannot be immutable and cannot
+/// be persistently mapped, and says so rather than pretending otherwise.
+#[no_mangle]
+pub unsafe extern "C" fn glBufferStorage(target: u32, size: isize, data: *const c_void, flags: u32) {
+    if size <= 0 {
+        errors().set(GL_INVALID_VALUE);
+        return;
+    }
+    let buffer = bound_buffer_name(target);
+    if buffer == 0 || is_immutable(buffer) {
+        errors().set(GL_INVALID_OPERATION);
+        return;
+    }
+    // Buffer storage is NOT ES 3.1 core. EGL may return a non-null stub for the
+    // desktop name on PowerVR/Mesa. Gate on the extension and use its ES spelling.
+    let native_name = if shader_translation_is_es() {
+        if gles3::caps().has(b"GL_EXT_buffer_storage\0") {
+            Some("glBufferStorageEXT")
+        } else {
+            None
+        }
+    } else {
+        Some("glBufferStorage")
+    };
+    if let Some(name) = native_name {
+        if let Some(f) = driver_fn_cached::<unsafe extern "C" fn(u32, isize, *const c_void, u32)>(name) {
+            f(target, size, data, flags);
+            mark_immutable(buffer, flags);
+            return;
+        }
+    }
+    // Ordinary read/write maps are legal on mutable ES buffers. Persistent/coherent
+    // mappings are not: do not claim success with a buffer that cannot back them.
+    if flags & (0x0040 | 0x0080) != 0 {
+        log("[GLCompat] persistent buffer storage requires GL_EXT_buffer_storage on this GPU");
+        errors().set(GL_INVALID_OPERATION);
+        return;
+    }
+    if let Some(f) = driver_fn_cached::<unsafe extern "C" fn(u32, isize, *const c_void, u32)>("glBufferData") {
+        f(target, size, data, storage_usage(flags));
+        mark_immutable(buffer, flags);
+    } else {
+        errors().set(GL_INVALID_OPERATION);
+    }
+}
+
+/// `glBufferData` is a GL error on an immutable buffer, and re-specifies the store
+/// everywhere else.
+#[no_mangle]
+pub unsafe extern "C" fn glBufferData(t: u32, size: isize, data: *const c_void, usage: u32) {
+    if is_immutable(bound_buffer_name(t)) {
+        errors().set(GL_INVALID_OPERATION);
+        return;
+    }
+    match driver_fn_cached::<unsafe extern "C" fn(u32, isize, *const c_void, u32)>("glBufferData") {
+        Some(f) => f(t, size, data, usage),
+        None => errors().set(GL_INVALID_OPERATION),
+    }
+}
+
+/// Immutable storage allows subdata only when created with GL_DYNAMIC_STORAGE_BIT.
+#[no_mangle]
+pub unsafe extern "C" fn glBufferSubData(t: u32, o: isize, size: isize, data: *const c_void) {
+    if !immutable_allows_subdata(bound_buffer_name(t)) {
+        errors().set(GL_INVALID_OPERATION);
+        return;
+    }
+    match driver_fn_cached::<unsafe extern "C" fn(u32, isize, isize, *const c_void)>("glBufferSubData") {
+        Some(f) => f(t, o, size, data),
+        None => errors().set(GL_INVALID_OPERATION),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn glDeleteBuffers(n: i32, b: *const u32) {
+    if n >= 0 && !b.is_null() {
+        with_immutable(|v| {
+            for i in 0..n as usize {
+                let id = *b.add(i);
+                v.retain(|(x, _)| *x != id);
+            }
+        });
+    }
+    match driver_fn_cached::<unsafe extern "C" fn(i32, *const u32)>("glDeleteBuffers") {
+        Some(f) => f(n, b),
+        None => errors().set(GL_INVALID_OPERATION),
+    }
+}
+
+/// Looks up one of *our own* exported entry points by name.
+///
+/// See the note at its call site: this is what makes `resolve_proc` agree with what the
+/// library actually exports, instead of with hand-maintained tables.
+fn own_symbol(name: &[u8]) -> Option<*const c_void> {
+    if !name.starts_with(b"gl") {
+        return None;
+    }
+    // RTLD_DEFAULT/Library::this() can find system GLES instead of us, and cannot
+    // see this library at all when the launcher loaded it RTLD_LOCAL. Locate this
+    // very DSO by an address within it, then dlsym its own handle.
+    #[repr(C)]
+    struct DlInfo {
+        filename: *const c_char,
+        base: *mut c_void,
+        symbol: *const c_char,
+        address: *mut c_void,
+    }
+    #[link(name = "dl")]
+    extern "C" {
+        fn dladdr(address: *const c_void, info: *mut DlInfo) -> i32;
+    }
+    static THIS: OnceLock<Option<libloading::Library>> = OnceLock::new();
+    let lib = THIS.get_or_init(|| unsafe {
+        let mut info: DlInfo = std::mem::zeroed();
+        if dladdr(own_symbol as *const c_void, &mut info) == 0 || info.filename.is_null() {
+            return None;
+        }
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::OsStr::from_bytes(CStr::from_ptr(info.filename).to_bytes());
+        libloading::Library::new(path).ok()
+    }).as_ref()?;
+    // SAFETY: the value is a code address that is only ever returned to the caller, never
+    // called here, and the handle it came from is never dropped.
+    let sym: libloading::Symbol<*const c_void> =
+        unsafe { lib.get(name) }.ok()?;
+    Some(*sym)
+}
+
+/// Test-only view of `own_symbol`, so a module can assert that the names it declares are
+/// genuinely exported rather than assuming it.
+#[cfg(test)]
+pub(crate) fn own_symbol_for_test(name: &[u8]) -> Option<*const c_void> {
+    own_symbol(name)
+}
+
+/// Records the target a texture name is bound to, then forwards.
+///
+/// Learning a texture's target only from `glCreateTextures` was a real gap: a name bound with
+/// plain `glBindTexture` says just as much about where it lives, and the DSA paths that need
+/// the target were falling back to "assuming 2D". A 1.21.11 replay logged exactly that for
+/// textures 0, 1, 2, 9, 17, 18 and 19.
+#[no_mangle]
+pub unsafe extern "C" fn glBindTexture(target: u32, texture: u32) {
+    if texture != 0 && named_objects::is_bindable_texture_target(target) {
+        named_objects::note_texture_target(texture, target);
+    }
+    match driver_fn_cached::<unsafe extern "C" fn(u32, u32)>("glBindTexture") {
+        Some(f) => f(target, texture),
+        None => errors().set(GL_INVALID_OPERATION),
+    }
+}
+
+fn resolve_proc(n: &[u8]) -> *const c_void {
+    match n {
+        b"glGetError" => glGetError as *const c_void,
+        b"glClearColor" => glClearColor as *const c_void,
+        b"glClear" => glClear as *const c_void,
+        b"glViewport" => glViewport as *const c_void,
+        b"glEnable" => glEnable as *const c_void,
+        b"glDisable" => glDisable as *const c_void,
+        b"glGetString" => glGetString as *const c_void,
+        b"glGetIntegerv" => glGetIntegerv as *const c_void,
+        b"glGetBooleanv" => glGetBooleanv as *const c_void,
+        b"glGetStringi" => glGetStringi as *const c_void,
+        b"glClearDepth" => glClearDepth as *const c_void,
+        b"glDepthRange" => glDepthRange as *const c_void,
+        b"glShaderSource" => glShaderSource as *const c_void,
+        b"glCompileShader" => glCompileShader as *const c_void,
+        b"glTexImage2D" => glTexImage2D as *const c_void,
+        b"glTexSubImage2D" => glTexSubImage2D as *const c_void,
+        b"glTexParameteri" => glTexParameteri as *const c_void,
+        b"glDrawBuffer" => glDrawBuffer as *const c_void,
+        b"glReadBuffer" => glReadBuffer as *const c_void,
+        b"glMapBuffer" => glMapBuffer as *const c_void,
+        b"glBufferStorage" => glBufferStorage as *const c_void,
+        b"glBufferData" => glBufferData as *const c_void,
+        b"glBufferSubData" => glBufferSubData as *const c_void,
+        b"glDeleteBuffers" => glDeleteBuffers as *const c_void,
+        b"glBindBuffer" => glBindBuffer as *const c_void,
+        b"glDrawRangeElementsBaseVertex" => gl::v3_3::glDrawRangeElementsBaseVertex as *const c_void,
+        b"glDrawElementsBaseVertex" => gl::v3_3::glDrawElementsBaseVertex as *const c_void,
+        b"glDrawElementsInstancedBaseVertex" => gl::v3_3::glDrawElementsInstancedBaseVertex as *const c_void,
+        // Direct State Access (GL 4.5 / ARB_DSA), emulated in dsa.rs
+        b"glCreateBuffers" => vertex_state::glCreateBuffers as *const c_void,
+        b"glCreateVertexArrays" => vertex_state::glCreateVertexArrays as *const c_void,
+        b"glNamedBufferData" => vertex_state::glNamedBufferData as *const c_void,
+        b"glNamedBufferStorage" => vertex_state::glNamedBufferStorage as *const c_void,
+        b"glNamedBufferSubData" => vertex_state::glNamedBufferSubData as *const c_void,
+        b"glGetNamedBufferSubData" => vertex_state::glGetNamedBufferSubData as *const c_void,
+        b"glGetNamedBufferParameteriv" => vertex_state::glGetNamedBufferParameteriv as *const c_void,
+        b"glVertexArrayVertexBuffer" => vertex_state::glVertexArrayVertexBuffer as *const c_void,
+        b"glVertexArrayElementBuffer" => vertex_state::glVertexArrayElementBuffer as *const c_void,
+        b"glVertexArrayAttribFormat" => vertex_state::glVertexArrayAttribFormat as *const c_void,
+        b"glVertexArrayAttribIFormat" => vertex_state::glVertexArrayAttribIFormat as *const c_void,
+        b"glVertexArrayAttribLFormat" => vertex_state::glVertexArrayAttribLFormat as *const c_void,
+        b"glVertexArrayBindingDivisor" => vertex_state::glVertexArrayBindingDivisor as *const c_void,
+        // Named-object (DSA) spellings, emulated in dsa_named.rs
+        b"glCreateTextures" => named_objects::glCreateTextures as *const c_void,
+        b"glCreateFramebuffers" => named_objects::glCreateFramebuffers as *const c_void,
+        b"glCreateRenderbuffers" => named_objects::glCreateRenderbuffers as *const c_void,
+        b"glCreateSamplers" => named_objects::glCreateSamplers as *const c_void,
+        b"glCreateQueries" => named_objects::glCreateQueries as *const c_void,
+        b"glTextureParameteri" => named_objects::glTextureParameteri as *const c_void,
+        b"glTextureParameterf" => named_objects::glTextureParameterf as *const c_void,
+        b"glTextureParameteriv" => named_objects::glTextureParameteriv as *const c_void,
+        b"glTextureParameterfv" => named_objects::glTextureParameterfv as *const c_void,
+        b"glTextureParameterIiv" => named_objects::glTextureParameterIiv as *const c_void,
+        b"glTextureParameterIuiv" => named_objects::glTextureParameterIuiv as *const c_void,
+        b"glGenerateTextureMipmap" => named_objects::glGenerateTextureMipmap as *const c_void,
+        b"glGetTextureParameterIiv" => named_objects::glGetTextureParameterIiv as *const c_void,
+        b"glGetTextureParameterIuiv" => named_objects::glGetTextureParameterIuiv as *const c_void,
+        b"glGetTextureLevelParameterfv" => named_objects::glGetTextureLevelParameterfv as *const c_void,
+        b"glGetCompressedTextureImage" => named_objects::glGetCompressedTextureImage as *const c_void,
+        b"glNamedFramebufferTexture" => named_objects::glNamedFramebufferTexture as *const c_void,
+        b"glNamedFramebufferTextureLayer" => named_objects::glNamedFramebufferTextureLayer as *const c_void,
+        b"glNamedFramebufferRenderbuffer" => named_objects::glNamedFramebufferRenderbuffer as *const c_void,
+        b"glNamedFramebufferDrawBuffer" => named_objects::glNamedFramebufferDrawBuffer as *const c_void,
+        b"glNamedFramebufferDrawBuffers" => named_objects::glNamedFramebufferDrawBuffers as *const c_void,
+        b"glNamedFramebufferReadBuffer" => named_objects::glNamedFramebufferReadBuffer as *const c_void,
+        b"glCheckNamedFramebufferStatus" => named_objects::glCheckNamedFramebufferStatus as *const c_void,
+        b"glGetNamedFramebufferAttachmentParameteriv" => named_objects::glGetNamedFramebufferAttachmentParameteriv as *const c_void,
+        b"glClearNamedFramebufferiv" => named_objects::glClearNamedFramebufferiv as *const c_void,
+        b"glClearNamedFramebufferuiv" => named_objects::glClearNamedFramebufferuiv as *const c_void,
+        b"glClearNamedFramebufferfv" => named_objects::glClearNamedFramebufferfv as *const c_void,
+        b"glClearNamedFramebufferfi" => named_objects::glClearNamedFramebufferfi as *const c_void,
+        b"glNamedRenderbufferStorage" => named_objects::glNamedRenderbufferStorage as *const c_void,
+        b"glNamedRenderbufferStorageMultisample" => named_objects::glNamedRenderbufferStorageMultisample as *const c_void,
+        b"glGetNamedRenderbufferParameteriv" => named_objects::glGetNamedRenderbufferParameteriv as *const c_void,
+        b"glMapNamedBuffer" => named_objects::glMapNamedBuffer as *const c_void,
+        b"glMapNamedBufferRange" => named_objects::glMapNamedBufferRange as *const c_void,
+        b"glUnmapNamedBuffer" => named_objects::glUnmapNamedBuffer as *const c_void,
+        b"glFlushMappedNamedBufferRange" => named_objects::glFlushMappedNamedBufferRange as *const c_void,
+        b"glGetNamedBufferPointerv" => named_objects::glGetNamedBufferPointerv as *const c_void,
+        b"glGetNamedBufferParameteri64v" => named_objects::glGetNamedBufferParameteri64v as *const c_void,
+        b"glCopyNamedBufferSubData" => named_objects::glCopyNamedBufferSubData as *const c_void,
+        b"glDrawArraysInstancedARB" => named_objects::glDrawArraysInstancedARB as *const c_void,
+        b"glDrawElementsInstancedARB" => named_objects::glDrawElementsInstancedARB as *const c_void,
+        b"glVertexAttribDivisorARB" => named_objects::glVertexAttribDivisorARB as *const c_void,
+        b"glBindTextures" => named_objects::glBindTextures as *const c_void,
+        b"glBindSamplers" => named_objects::glBindSamplers as *const c_void,
+        b"glBindBuffersBase" => named_objects::glBindBuffersBase as *const c_void,
+        b"glBindBuffersRange" => named_objects::glBindBuffersRange as *const c_void,
+        b"glBindVertexBuffers" => named_objects::glBindVertexBuffers as *const c_void,
+        b"glVertexArrayVertexBuffers" => named_objects::glVertexArrayVertexBuffers as *const c_void,
+        b"glGetVertexArrayiv" => named_objects::glGetVertexArrayiv as *const c_void,
+        b"glGetVertexArrayIndexediv" => named_objects::glGetVertexArrayIndexediv as *const c_void,
+        b"glGetVertexArrayIndexed64iv" => named_objects::glGetVertexArrayIndexed64iv as *const c_void,
+        b"glTextureStorage1D" => named_objects::glTextureStorage1D as *const c_void,
+        b"glTextureSubImage1D" => named_objects::glTextureSubImage1D as *const c_void,
+        b"glCompressedTextureSubImage1D" => named_objects::glCompressedTextureSubImage1D as *const c_void,
+        b"glCopyTextureSubImage1D" => named_objects::glCopyTextureSubImage1D as *const c_void,
+        b"glTextureBuffer" => named_objects::glTextureBuffer as *const c_void,
+        b"glNamedFramebufferTextureMultiviewOVR" => named_objects::glNamedFramebufferTextureMultiviewOVR as *const c_void,
+        b"glGetProgramResourceLocationIndex" => named_objects::glGetProgramResourceLocationIndex as *const c_void,
+        b"glTexStorage2DMultisample" => named_objects::glTexStorage2DMultisample as *const c_void,
+        b"glTexStorage3DMultisample" => named_objects::glTexStorage3DMultisample as *const c_void,
+        b"glTextureStorage2DMultisample" => named_objects::glTextureStorage2DMultisample as *const c_void,
+        b"glTextureView" => named_objects::glTextureView as *const c_void,
+        b"glGetActiveAtomicCounterBufferiv" => named_objects::glGetActiveAtomicCounterBufferiv as *const c_void,
+        b"glVertexArrayAttribStride" => vertex_state::glVertexArrayAttribStride as *const c_void,
+        b"glVertexAttribStride" => vertex_state::glVertexAttribStride as *const c_void,
+        b"glGetVertexArrayAttribStride" => vertex_state::glGetVertexArrayAttribStride as *const c_void,
+        b"glGetVertexAttribStride" => vertex_state::glGetVertexAttribStride as *const c_void,
+        b"glVertexArrayAttribBinding" => vertex_state::glVertexArrayAttribBinding as *const c_void,
+        b"glVertexAttribFormat" => gl::v3_3::glVertexAttribFormat as *const c_void,
+        b"glVertexAttribBinding" => gl::v3_3::glVertexAttribBinding as *const c_void,
+        b"glVertexBindingDivisor" => gl::v3_3::glVertexBindingDivisor as *const c_void,
+        b"glVertexAttribIFormat" => gl::v3_3::glVertexAttribIFormat as *const c_void,
+        b"glBindVertexBuffer" => vertex_state::glBindVertexBuffer as *const c_void,
+        b"glEnableVertexArrayAttrib" => vertex_state::glEnableVertexArrayAttrib as *const c_void,
+        b"glDisableVertexArrayAttrib" => vertex_state::glDisableVertexArrayAttrib as *const c_void,
+        b"glTextureStorage2D" => vertex_state::glTextureStorage2D as *const c_void,
+        b"glTextureStorage3D" => vertex_state::glTextureStorage3D as *const c_void,
+        b"glTextureSubImage2D" => vertex_state::glTextureSubImage2D as *const c_void,
+        b"glTextureSubImage3D" => vertex_state::glTextureSubImage3D as *const c_void,
+        b"glMemoryBarrier" => vertex_state::glMemoryBarrier as *const c_void,
+        b"glMemoryBarrierByRegion" => vertex_state::glMemoryBarrierByRegion as *const c_void,
+        b"glObjectLabel" => vertex_state::glObjectLabel as *const c_void,
+        b"glObjectPtrLabel" => vertex_state::glObjectPtrLabel as *const c_void,
+        b"glPushDebugGroup" => vertex_state::glPushDebugGroup as *const c_void,
+        b"glPopDebugGroup" => vertex_state::glPopDebugGroup as *const c_void,
+        b"glDebugMessageCallback" => vertex_state::glDebugMessageCallback as *const c_void,
+        b"glDebugMessageCallbackARB" => vertex_state::glDebugMessageCallbackARB as *const c_void,
+        b"glDebugMessageControl" => vertex_state::glDebugMessageControl as *const c_void,
+        b"glDebugMessageControlARB" => vertex_state::glDebugMessageControlARB as *const c_void,
+        b"glBindImageTexture" => named_objects::glBindImageTexture as *const c_void,
+        b"glMultiDrawElementsBaseVertex" => named_objects::glMultiDrawElementsBaseVertex as *const c_void,
+        b"glGetGraphicsResetStatus" => vertex_state::glGetGraphicsResetStatus as *const c_void,
+        b"glMultiDrawArraysIndirect" => vertex_state::glMultiDrawArraysIndirect as *const c_void,
+        b"glMultiDrawElementsIndirect" => vertex_state::glMultiDrawElementsIndirect as *const c_void,
+        b"glDispatchCompute" => vertex_state::glDispatchCompute as *const c_void,
+        b"glPixelStorei" => glPixelStorei as *const c_void,
+        b"glPolygonMode" => glPolygonMode as *const c_void,
+        b"glXGetProcAddress" | b"glXGetProcAddressARB" | b"glGetProcAddress" => {
+            glXGetProcAddress as *const c_void
+        }
+        b"eglGetProcAddress" => eglGetProcAddress as *const c_void,
+                b"glDrawArrays" => glDrawArrays as *const c_void,
+        b"glMatrixMode" => glMatrixMode as *const c_void,
+        b"glLoadIdentity" => glLoadIdentity as *const c_void,
+        b"glPushMatrix" => glPushMatrix as *const c_void,
+        b"glPopMatrix" => glPopMatrix as *const c_void,
+        b"glLoadMatrixf" => glLoadMatrixf as *const c_void,
+        b"glMultMatrixf" => glMultMatrixf as *const c_void,
+        b"glTranslatef" => glTranslatef as *const c_void,
+        b"glScalef" => glScalef as *const c_void,
+        b"glRotatef" => glRotatef as *const c_void,
+        b"glOrtho" => glOrtho as *const c_void,
+        b"glFrustum" => glFrustum as *const c_void,
+        b"glEnableClientState" => glEnableClientState as *const c_void,
+        b"glDisableClientState" => glDisableClientState as *const c_void,
+        b"glVertexPointer" => glVertexPointer as *const c_void,
+        b"glColorPointer" => glColorPointer as *const c_void,
+        b"glTexCoordPointer" => glTexCoordPointer as *const c_void,
+        b"glNormalPointer" => glNormalPointer as *const c_void,
+        b"glClientActiveTexture" => glClientActiveTexture as *const c_void,
+        b"glActiveTexture" => glActiveTexture as *const c_void,
+        b"glActiveTextureARB" => glActiveTexture as *const c_void,
+        b"glClientActiveTextureARB" => glClientActiveTexture as *const c_void,
+        b"glColor4f" => glColor4f as *const c_void,
+        b"glColor3f" => glColor3f as *const c_void,
+        b"glAlphaFunc" => glAlphaFunc as *const c_void,
+        b"glFogf" => glFogf as *const c_void,
+        b"glFogi" => glFogi as *const c_void,
+        b"glFogfv" => glFogfv as *const c_void,
+        b"glShadeModel" => glShadeModel as *const c_void,
+        b"glTexEnvf" => glTexEnvf as *const c_void,
+        b"glTexEnvi" => glTexEnvi as *const c_void,
+        b"glTexEnvfv" => glTexEnvfv as *const c_void,
+        b"glLightf" => glLightf as *const c_void,
+        b"glLightfv" => glLightfv as *const c_void,
+        b"glLightModeli" => glLightModeli as *const c_void,
+        b"glLightModelf" => glLightModelf as *const c_void,
+        b"glLightModelfv" => glLightModelfv as *const c_void,
+        b"glMaterialf" => glMaterialf as *const c_void,
+        b"glMaterialfv" => glMaterialfv as *const c_void,
+        b"glColorMaterial" => glColorMaterial as *const c_void,
+        b"glGetDoublev" => glGetDoublev as *const c_void,
+        b"glPixelStoref" => glPixelStoref as *const c_void,
+        b"glTexParameterf" => glTexParameterf as *const c_void,
+        b"glTexParameteriv" => glTexParameteriv as *const c_void,
+        b"glTexParameterfv" => glTexParameterfv as *const c_void,
+        b"glRenderbufferStorage" => glRenderbufferStorage as *const c_void,
+        b"glBindTexture" => glBindTexture as *const c_void,
+        b"glLightModeliv" => glLightModeliv as *const c_void,
+        b"glFramebufferTexture2D" => glFramebufferTexture2D as *const c_void,
+        b"glCheckFramebufferStatus" => glCheckFramebufferStatus as *const c_void,
+        b"glFogColor" => fixed_func::glFogColor as *const c_void,
+        b"glGetTexLevelParameteriv" => glGetTexLevelParameteriv as *const c_void,
+        b"eglGetDisplay" => eglGetDisplay as *const c_void,
+        b"eglInitialize" => eglInitialize as *const c_void,
+        b"eglTerminate" => eglTerminate as *const c_void,
+        b"eglChooseConfig" => eglChooseConfig as *const c_void,
+        b"eglGetConfigs" => eglGetConfigs as *const c_void,
+        b"eglGetConfigAttrib" => eglGetConfigAttrib as *const c_void,
+        b"eglCreateWindowSurface" => eglCreateWindowSurface as *const c_void,
+        b"eglCreatePbufferSurface" => eglCreatePbufferSurface as *const c_void,
+        b"eglDestroySurface" => eglDestroySurface as *const c_void,
+        b"eglBindAPI" => eglBindAPI as *const c_void,
+        b"eglCreateContext" => eglCreateContext as *const c_void,
+        b"eglDestroyContext" => eglDestroyContext as *const c_void,
+        b"eglMakeCurrent" => eglMakeCurrent as *const c_void,
+        b"eglGetCurrentContext" => eglGetCurrentContext as *const c_void,
+        b"eglGetCurrentDisplay" => eglGetCurrentDisplay as *const c_void,
+        b"eglGetCurrentSurface" => eglGetCurrentSurface as *const c_void,
+        b"eglQuerySurface" => eglQuerySurface as *const c_void,
+        b"eglSwapBuffers" => eglSwapBuffers as *const c_void,
+        b"eglGetPlatformDisplay" => eglGetPlatformDisplay as *const c_void,
+        b"eglGetPlatformDisplayEXT" => eglGetPlatformDisplayEXT as *const c_void,
+        b"eglCreatePlatformWindowSurface" => eglCreatePlatformWindowSurface as *const c_void,
+        b"eglCreatePlatformWindowSurfaceEXT" => eglCreatePlatformWindowSurfaceEXT as *const c_void,
+        b"eglSwapBuffersWithDamageKHR" => eglSwapBuffersWithDamageKHR as *const c_void,
+        b"eglSwapBuffersWithDamageEXT" => eglSwapBuffersWithDamageEXT as *const c_void,
+        b"eglSwapInterval" => eglSwapInterval as *const c_void,
+        b"eglQueryString" => eglQueryString as *const c_void,
+        b"eglGetError" => eglGetError as *const c_void,
+        b"eglReleaseThread" => eglReleaseThread as *const c_void,
+        _ => {
+            // Immediate mode is implemented here; it must win over the stub table below.
+            let imm = immediate::resolve(n);
+            if !imm.is_null() {
+                return imm;
+            }
+            let compat = gl::v3_3::resolve(n);
+            if !compat.is_null() {
+                return compat;
+            }
+            let compat = gl::v4_5::resolve(n);
+            if !compat.is_null() {
+                return compat;
+            }
+            let f = forwarded(n);
+            if !f.is_null() {
+                return f;
+            }
+            // Exported legacy functions (display lists, colors, texture environment) must
+            // win over system EGL's ES1 entry points and non-null unsupported stubs.
+            if let Some(p) = own_symbol(n) {
+                return p;
+            }
+            // LWJGL bridge: resolve unknown names from GLES driver / eglGetProcAddress
+            let name = String::from_utf8_lossy(n);
+            // Try ARB/EXT/OES suffix strip for desktop aliases
+            let base = name
+                .strip_suffix("ARB")
+                .or_else(|| name.strip_suffix("EXT"))
+                .or_else(|| name.strip_suffix("OES"))
+                .or_else(|| name.strip_suffix("KHR"))
+                .unwrap_or(&name);
+            if base.as_bytes() != n {
+                let f2 = forwarded(base.as_bytes());
+                if !f2.is_null() {
+                    return f2;
+                }
+            }
+            if let Some(ptr) = unsafe {
+                let mut out: Option<*const c_void> = None;
+                // prefer direct GLES dlsym
+                if let Some(drv) = gles_driver() {
+                    let mut buf = [0u8; 128];
+                    if n.len() < buf.len() {
+                        buf[..n.len()].copy_from_slice(n);
+                        buf[n.len()] = 0;
+                        if let Ok(s) = drv.lib.get::<unsafe extern "C" fn()>(&buf[..=n.len()]) {
+                            out = Some(*s as *const c_void);
+                        }
+                    }
+                }
+                out
+            } {
+                if !ptr.is_null() {
+                    return ptr;
+                }
+            }
+            if let Some(ptr) = sys_egl_get_proc(&name) {
+                if !ptr.is_null() {
+                    return ptr;
+                }
+            }
+            let stub = resolve_legacy_stub(n);
+            if !stub.is_null() {
+                return stub;
+            }
+            let core = resolve_core_unsupported(n);
+            if !core.is_null() {
+                return core;
+            }
+            // Never hand back NULL for a GL name. LWJGL resolves a function pointer once and
+            // calls it directly, so a null here is SIGSEGV at address 0 on the render thread
+            // with no GL error to explain it -- which is how glFogfv killed 1.16.5. A no-op
+            // stub costs the feature this one entry point provides and nothing else, so
+            // degrade and say so loudly instead of killing the process.
+            if name.starts_with("gl") {
+                static MISSING_ONCE: Mutex<Vec<String>> = Mutex::new(Vec::new());
+                let first_time = MISSING_ONCE
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .all(|s| s.as_str() != name.as_ref());
+                if first_time {
+                    MISSING_ONCE
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(name.to_string());
+                    log(&format!(
+                        "[GLBridge] unresolved entry point '{name}': returning a no-op stub. \
+                         Whatever needs it will misbehave, but the process survives."
+                    ));
+                }
+                return legacy_noop_fn as *const c_void;
+            }
+            log(&format!("[GLBridge] Missing entry point: {name}"));
+            std::ptr::null()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn glXGetProcAddress(name: *const c_char) -> *const c_void {
+    if name.is_null() {
+        return std::ptr::null();
+    }
+    // SAFETY: caller passes a NUL-terminated C string per the GLX contract; null checked above.
+    let n = unsafe { CStr::from_ptr(name) }.to_bytes();
+    resolve_proc(n)
+}
+
+#[no_mangle]
+pub extern "C" fn glXGetProcAddressARB(name: *const c_char) -> *const c_void {
+    glXGetProcAddress(name)
+}
+
+
+
+#[no_mangle]
+pub extern "C" fn glGetProcAddress(name: *const c_char) -> *const c_void {
+    glXGetProcAddress(name)
+}
+
+/// Some LWJGL / GLFW paths probe the WGL name even on non-Windows hosts.
+#[no_mangle]
+pub extern "C" fn wglGetProcAddress(name: *const c_char) -> *const c_void {
+    glXGetProcAddress(name)
+}
+
+
+
+
+// =============================================================================
+// Fixed-function desktop GL shims (matrix stack, client arrays, legacy state)
+// =============================================================================
+
+#[no_mangle] pub extern "C" fn glMatrixMode(mode: u32) { fixed_func::gl_matrix_mode(mode); }
+#[no_mangle] pub extern "C" fn glLoadIdentity() { fixed_func::gl_load_identity(); }
+#[no_mangle] pub extern "C" fn glPushMatrix() { fixed_func::gl_push_matrix(); }
+#[no_mangle] pub extern "C" fn glPopMatrix() { fixed_func::gl_pop_matrix(); }
+#[no_mangle] pub unsafe extern "C" fn glLoadMatrixf(m: *const f32) { fixed_func::gl_load_matrixf(m); }
+#[no_mangle] pub unsafe extern "C" fn glMultMatrixf(m: *const f32) { fixed_func::gl_mult_matrixf(m); }
+#[no_mangle] pub extern "C" fn glTranslatef(x: f32, y: f32, z: f32) { fixed_func::gl_translatef(x, y, z); }
+#[no_mangle] pub extern "C" fn glScalef(x: f32, y: f32, z: f32) { fixed_func::gl_scalef(x, y, z); }
+#[no_mangle] pub extern "C" fn glRotatef(a: f32, x: f32, y: f32, z: f32) { fixed_func::gl_rotatef(a, x, y, z); }
+#[no_mangle] pub extern "C" fn glOrtho(l: f64, r: f64, b: f64, t: f64, n: f64, f: f64) { fixed_func::gl_ortho(l, r, b, t, n, f); }
+#[no_mangle] pub extern "C" fn glFrustum(l: f64, r: f64, b: f64, t: f64, n: f64, f: f64) { fixed_func::gl_frustum(l, r, b, t, n, f); }
+#[no_mangle] pub extern "C" fn glEnableClientState(cap: u32) { fixed_func::gl_enable_client_state(cap); }
+#[no_mangle] pub extern "C" fn glDisableClientState(cap: u32) { fixed_func::gl_disable_client_state(cap); }
+#[no_mangle] pub unsafe extern "C" fn glVertexPointer(size: i32, ty: u32, stride: i32, ptr: *const c_void) { fixed_func::gl_vertex_pointer(size, ty, stride, ptr); }
+#[no_mangle] pub unsafe extern "C" fn glColorPointer(size: i32, ty: u32, stride: i32, ptr: *const c_void) { fixed_func::gl_color_pointer(size, ty, stride, ptr); }
+#[no_mangle] pub unsafe extern "C" fn glTexCoordPointer(size: i32, ty: u32, stride: i32, ptr: *const c_void) { fixed_func::gl_tex_coord_pointer(size, ty, stride, ptr); }
+#[no_mangle] pub unsafe extern "C" fn glNormalPointer(ty: u32, stride: i32, ptr: *const c_void) { fixed_func::gl_normal_pointer(ty, stride, ptr); }
+/// Tracks the active unit for the fixed-function emulation (texture matrices and the
+/// per-unit `GL_TEXTURE_2D` enable), then forwards to the driver.
+#[no_mangle]
+pub unsafe extern "C" fn glActiveTexture(texture: u32) {
+    fixed_func::set_active_texture(texture);
+    match driver_fn_cached::<unsafe extern "C" fn(u32)>("glActiveTexture") {
+        Some(f) => f(texture),
+        None => errors().set(GL_INVALID_OPERATION),
+    }
+}
+#[no_mangle] pub extern "C" fn glClientActiveTexture(texture: u32) { fixed_func::gl_client_active_texture(texture); }
+#[no_mangle] pub extern "C" fn glColor4f(r: f32, g: f32, b: f32, a: f32) { immediate::set_color(r, g, b, a); }
+#[no_mangle] pub extern "C" fn glColor3f(r: f32, g: f32, b: f32) { immediate::set_color(r, g, b, 1.0); }
+#[no_mangle] pub extern "C" fn glAlphaFunc(func: u32, ref_v: f32) { fixed_func::gl_alpha_func(func, ref_v); }
+#[no_mangle]
+#[export_name = "glFogf"]
+#[inline(never)]
+pub extern "C" fn glFogf(pname: u32, param: f32) { fixed_func::gl_fogf(pname, param); }
+#[no_mangle]
+#[export_name = "glFogi"]
+#[inline(never)]
+pub extern "C" fn glFogi(pname: u32, param: i32) { fixed_func::gl_fogi(pname, param); }
+#[no_mangle]
+#[export_name = "glFogfv"]
+#[inline(never)]
+pub unsafe extern "C" fn glFogfv(pname: u32, params: *const f32) { fixed_func::gl_fogfv(pname, params); }
+
+#[no_mangle]
+#[export_name = "glFogiv"]
+#[inline(never)]
+pub unsafe extern "C" fn glFogiv(pname: u32, params: *const i32) {
+    let _ = (pname, params);
+}
+
+
+#[no_mangle] pub extern "C" fn glShadeModel(mode: u32) { fixed_func::gl_shade_model(mode); }
+#[no_mangle] pub extern "C" fn glTexEnvf(target: u32, pname: u32, param: f32) { fixed_func::gl_tex_envf(target, pname, param); }
+#[no_mangle] pub extern "C" fn glTexEnvi(target: u32, pname: u32, param: i32) { fixed_func::gl_tex_envi(target, pname, param); }
+#[no_mangle] pub unsafe extern "C" fn glTexEnvfv(target: u32, pname: u32, params: *const f32) { fixed_func::gl_tex_envfv(target, pname, params); }
+
+// ---- fixed-function lighting: accepted and ignored (NOT emulated yet) ---------------------
+// Without these, lookups fall through to the driver's ES1 stubs, which raise
+// "OpenGL ES API version mismatch" on every call. Visual effect: surfaces render unlit.
+fn warn_once(name: &'static str) {
+    static SEEN: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.contains(&name) {
+        g.push(name);
+        log(&format!("[GLCompat] {name}: fixed-function lighting is not emulated yet; call ignored"));
+    }
+}
+#[no_mangle] pub extern "C" fn glLightf(_l: u32, _p: u32, _v: f32) { warn_once("glLightf"); }
+#[no_mangle] pub unsafe extern "C" fn glLightfv(_l: u32, _p: u32, _v: *const f32) { warn_once("glLightfv"); }
+#[no_mangle] pub extern "C" fn glLightModeli(_p: u32, _v: i32) { warn_once("glLightModeli"); }
+#[no_mangle] pub extern "C" fn glLightModeliv(_p: u32, _v: *const i32) { warn_once("glLightModeliv"); }
+#[no_mangle] pub extern "C" fn glLightModelf(_p: u32, _v: f32) { warn_once("glLightModelf"); }
+#[no_mangle] pub unsafe extern "C" fn glLightModelfv(_p: u32, _v: *const f32) { warn_once("glLightModelfv"); }
+#[no_mangle] pub extern "C" fn glMaterialf(_f: u32, _p: u32, _v: f32) { warn_once("glMaterialf"); }
+#[no_mangle] pub unsafe extern "C" fn glMaterialfv(_f: u32, _p: u32, _v: *const f32) { warn_once("glMaterialfv"); }
+#[no_mangle] pub extern "C" fn glColorMaterial(_f: u32, _m: u32) { warn_once("glColorMaterial"); }
+
+// =============================================================================
+// EGL forwarding — MobileGL-style: same .so is the EGL provider for the launcher.
+// We dlopen system libEGL once and re-export every entry the egl_loader needs.
+// No DT_NEEDED on libEGL (avoids linker/constructor fights in the game process).
+// =============================================================================
+
+struct SystemEgl {
+    lib: libloading::Library,
+}
+
+fn sys_egl() -> Option<&'static SystemEgl> {
+    static EGL: OnceLock<Option<SystemEgl>> = OnceLock::new();
+    EGL.get_or_init(|| {
+        let paths = [
+            "/system/lib64/libEGL.so",
+            "/system/lib/libEGL.so",
+            "/vendor/lib64/libEGL.so",
+            "/vendor/lib/libEGL.so",
+            "libEGL.so",
+        ];
+        for path in paths {
+            if let Ok(lib) = unsafe { libloading::Library::new(path) } {
+                log(&format!("[EGL] loaded system EGL from {path}"));
+                return Some(SystemEgl { lib });
+            }
+        }
+        log("[EGL] FAILED to load system libEGL.so");
+        None
+    })
+    .as_ref()
+}
+
+fn egl_sym<T>(name: &[u8]) -> Option<T>
+where
+    T: Copy,
+{
+    let e = sys_egl()?;
+    let s: libloading::Symbol<T> = unsafe { e.lib.get(name).ok()? };
+    Some(*s)
+}
+
+/// Makes a context current and drops every memoized entry point when the context changes.
+///
+/// `eglGetProcAddress` may return context-specific pointers, so cached addresses from a
+/// previous context must not be reused after a switch (or a context loss and recreate).
+/// This is the one EGL entry point where that transition is observable.
+#[no_mangle]
+pub unsafe extern "C" fn eglMakeCurrent(
+    dpy: *mut c_void,
+    draw: *mut c_void,
+    read: *mut c_void,
+    ctx: *mut c_void,
+) -> u32 {
+    type F = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> u32;
+    let previous = match egl_sym::<unsafe extern "C" fn() -> *mut c_void>(b"eglGetCurrentContext\0") {
+        Some(get) => get(),
+        None => std::ptr::null_mut(),
+    };
+    let mut z: u32 = 0;
+    match egl_sym::<F>(b"eglMakeCurrent\0") {
+        Some(f) => {
+            let r = f(dpy, draw, read, ctx);
+            if r != 0 && previous != ctx {
+                clear_driver_cache();
+            }
+            return r;
+        }
+        None => z = 0x3003, // EGL_BAD_MATCH: nothing to call
+    }
+    z
+}
+
+macro_rules! egl_export {
+    ($name:ident ( $($arg:ident : $ty:ty),* ) -> $ret:ty) => {
+        #[no_mangle]
+        pub unsafe extern "C" fn $name($($arg : $ty),*) -> $ret {
+            type F = unsafe extern "C" fn($($ty),*) -> $ret;
+            let n = concat!(stringify!($name), "\0");
+            match egl_sym::<F>(n.as_bytes()) {
+                Some(f) => f($($arg),*),
+                None => {
+                    // Safe zero defaults for pointer / int returns
+                    #[allow(unused_assignments, unused_mut)]
+                    let mut z: $ret = unsafe { std::mem::zeroed() };
+                    z
+                }
+            }
+        }
+    };
+    // void-ish already covered by -> type
+}
+
+// Core EGL 1.4 used by pojov egl_loader / glfwstub
+egl_export!(eglGetDisplay(display_id: *mut c_void) -> *mut c_void);
+egl_export!(eglInitialize(dpy: *mut c_void, major: *mut i32, minor: *mut i32) -> u32);
+egl_export!(eglTerminate(dpy: *mut c_void) -> u32);
+egl_export!(eglGetConfigs(dpy: *mut c_void, configs: *mut *mut c_void, config_size: i32, num: *mut i32) -> u32);
+egl_export!(eglGetConfigAttrib(dpy: *mut c_void, config: *mut c_void, attr: i32, value: *mut i32) -> u32);
+egl_export!(eglCreateWindowSurface(dpy: *mut c_void, config: *mut c_void, win: *mut c_void, attrib: *const i32) -> *mut c_void);
+egl_export!(eglCreatePbufferSurface(dpy: *mut c_void, config: *mut c_void, attrib: *const i32) -> *mut c_void);
+egl_export!(eglDestroySurface(dpy: *mut c_void, surface: *mut c_void) -> u32);
+egl_export!(eglDestroyContext(dpy: *mut c_void, ctx: *mut c_void) -> u32);
+egl_export!(eglGetCurrentContext() -> *mut c_void);
+egl_export!(eglGetCurrentDisplay() -> *mut c_void);
+egl_export!(eglGetCurrentSurface(readdraw: i32) -> *mut c_void);
+egl_export!(eglQuerySurface(dpy: *mut c_void, surface: *mut c_void, attr: i32, value: *mut i32) -> u32);
+egl_export!(eglSwapInterval(dpy: *mut c_void, interval: i32) -> u32);
+egl_export!(eglQueryString(dpy: *mut c_void, name: i32) -> *const u8);
+egl_export!(eglGetError() -> u32);
+egl_export!(eglReleaseThread() -> u32);
+egl_export!(eglBindTexImage(dpy: *mut c_void, surface: *mut c_void, buffer: i32) -> u32);
+egl_export!(eglReleaseTexImage(dpy: *mut c_void, surface: *mut c_void, buffer: i32) -> u32);
+egl_export!(eglSurfaceAttrib(dpy: *mut c_void, surface: *mut c_void, attr: i32, value: i32) -> u32);
+egl_export!(eglWaitClient() -> u32);
+egl_export!(eglWaitGL() -> u32);
+egl_export!(eglWaitNative(engine: i32) -> u32);
+egl_export!(eglQueryContext(dpy: *mut c_void, ctx: *mut c_void, attr: i32, value: *mut i32) -> u32);
+
+// =============================================================================
+// Context creation: a desktop-GL request has to become an ES request
+//
+// There is no desktop OpenGL on Android. Minecraft asks for what it asks on a PC - an
+// OpenGL 3.3 core, forward-compatible context - and on Android that has to arrive as
+// ES 3.x: EGL_CONTEXT_MAJOR_VERSION/MINOR_VERSION and the profile mask are EGL 1.5
+// desktop-GL attributes that an Android driver rejects, and EGL_CONTEXT_CLIENT_VERSION
+// is the one it understands. Minecraft 26.3+ makes this worse, because it creates the
+// context through SDL3 with the same PC attributes instead of through a launcher stub
+// that already knows better.
+//
+// So `eglCreateContext` rewrites what cannot work into what can. A request that already
+// names an ES version is passed through untouched - every launcher today does that, and
+// this must not change behaviour for them.
+// =============================================================================
+
+/// `EGL_CONTEXT_CLIENT_VERSION` and `EGL_CONTEXT_MAJOR_VERSION` are the same token -
+/// 0x3098 - in Khronos' egl.h: for an ES context it names the ES version, for a
+/// desktop-GL context the GL major version. Which one a list means is decided by the API
+/// the caller bound, not by the number, so the rewrite below keys off `bound_api` and an
+/// ES request is left strictly alone.
+const EGL_NONE: i32 = 0x3038;
+const EGL_OPENGL_ES_API: u32 = 0x30A0;
+const EGL_OPENGL_API: u32 = 0x30A2;
+const EGL_CONTEXT_VERSION: i32 = 0x3098; // CLIENT_VERSION for ES, MAJOR_VERSION for GL
+const EGL_CONTEXT_MINOR_VERSION: i32 = 0x30FB;
+const EGL_CONTEXT_FLAGS: i32 = 0x30FC;
+const EGL_CONTEXT_OPENGL_PROFILE_MASK: i32 = 0x30FD;
+
+/// What the caller *asked* for. Android can only answer with ES, but the lie has to be
+/// consistent: a game that binds EGL_OPENGL_API and then queries it must hear
+/// EGL_OPENGL_API back, or it will reject the context it just got.
+static BOUND_API: AtomicU32 = AtomicU32::new(EGL_OPENGL_ES_API);
+
+/// Rewrites a **desktop-GL** context attribute list into one an Android EGL driver can
+/// satisfy. Returns the list and whether anything was rewritten.
+///
+/// An ES request - which is what every launcher today makes, and what the ES path of SDL3
+/// makes - is returned untouched: changing it could only break working setups. Only the
+/// attributes that no ES driver accepts are removed:
+///
+/// * the version token is kept, pinned to 3 (the context is ES 3.x either way, and the
+///   version *string* the game sees is spoofed separately);
+/// * the GL minor version, the GL profile mask and the GL context flags (which carry the
+///   forward-compatible and debug bits) have no ES meaning and are dropped.
+fn normalize_context_attribs(attribs: &[i32], bound_api: u32) -> (Vec<i32>, bool) {
+    if bound_api != EGL_OPENGL_API {
+        return (attribs.to_vec(), false);
+    }
+    let mut out: Vec<i32> = Vec::with_capacity(attribs.len() + 4);
+    let mut changed = false;
+    let mut have_version = false;
+
+    let mut i = 0;
+    while i + 1 < attribs.len() {
+        let key = attribs[i];
+        let value = attribs[i + 1];
+        if key == EGL_NONE {
+            break;
+        }
+        match key {
+            EGL_CONTEXT_VERSION => {
+                have_version = true;
+                changed |= value != 3;
+                out.push(EGL_CONTEXT_VERSION);
+                out.push(3);
+            }
+            EGL_CONTEXT_MINOR_VERSION | EGL_CONTEXT_OPENGL_PROFILE_MASK | EGL_CONTEXT_FLAGS => {
+                changed = true;
+            }
+            _ => {
+                out.push(key);
+                out.push(value);
+            }
+        }
+        i += 2;
+    }
+    if !have_version {
+        changed = true;
+        out.push(EGL_CONTEXT_VERSION);
+        out.push(3);
+    }
+    out.push(EGL_NONE);
+    (out, changed)
+}
+
+/// Reads a context attribute list, or an empty one when the caller passed null.
+unsafe fn read_attrib_list(attribs: *const i32) -> Vec<i32> {
+    if attribs.is_null() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut i = 0;
+    loop {
+        let v = *attribs.add(i);
+        out.push(v);
+        if v == EGL_NONE {
+            return out;
+        }
+        i += 1;
+    }
+}
+
+/// EGL config attribute names used by the `eglChooseConfig` fallback below.
+const EGL_ALPHA_SIZE: i32 = 0x3021;
+const EGL_DEPTH_SIZE: i32 = 0x3025;
+const EGL_STENCIL_SIZE: i32 = 0x3026;
+const EGL_SAMPLES: i32 = 0x3031;
+const EGL_SAMPLE_BUFFERS: i32 = 0x3032;
+const EGL_SURFACE_TYPE: i32 = 0x3033;
+const EGL_RENDERABLE_TYPE: i32 = 0x3040;
+
+/// The next, plainer `eglChooseConfig` attribute list to try: `None` when there is nothing
+/// left to relax.
+///
+/// Some drivers - several Mali parts among them - answer `EGL_TRUE` with **zero** configs
+/// for a list they cannot satisfy, typically depth 24 plus stencil 8 plus multisampling.
+/// The launcher then reports a failed OpenGL path with nothing to say what was refused, so
+/// each step drops the attribute most likely to be the one:
+///
+/// 1. multisampling and stencil, 2. alpha too, and depth clamped to 16,
+/// 3. only the surface and renderable requirements survive.
+fn relax_config_attribs(attribs: &[i32], step: usize) -> Option<Vec<i32>> {
+    if attribs.len() <= 1 {
+        return None; // only EGL_NONE: there is nothing to relax
+    }
+    let dropped: &[i32] = match step {
+        1 => &[EGL_SAMPLES, EGL_SAMPLE_BUFFERS, EGL_STENCIL_SIZE],
+        2 => &[EGL_SAMPLES, EGL_SAMPLE_BUFFERS, EGL_STENCIL_SIZE, EGL_ALPHA_SIZE],
+        3 => &[EGL_SAMPLES, EGL_SAMPLE_BUFFERS, EGL_STENCIL_SIZE, EGL_ALPHA_SIZE],
+        _ => return None,
+    };
+    let mut out: Vec<i32> = Vec::with_capacity(attribs.len());
+    let mut i = 0;
+    while i + 1 < attribs.len() {
+        let (key, value) = (attribs[i], attribs[i + 1]);
+        if key == EGL_NONE {
+            break;
+        }
+        if dropped.contains(&key) {
+            i += 2;
+            continue;
+        }
+        if step >= 3 && key != EGL_SURFACE_TYPE && key != EGL_RENDERABLE_TYPE {
+            i += 2;
+            continue;
+        }
+        if key == EGL_DEPTH_SIZE && value > 16 && step >= 2 {
+            out.push(key);
+            out.push(16);
+        } else {
+            out.push(key);
+            out.push(value);
+        }
+        i += 2;
+    }
+    out.push(EGL_NONE);
+    if out.len() == 1 {
+        None // nothing survived
+    } else {
+        Some(out)
+    }
+}
+
+/// `eglChooseConfig`, with a fallback when the driver matches nothing.
+///
+/// A plain forward returns whatever the driver said, and a driver that matched zero configs
+/// leaves the caller with no context and no explanation - which is what "the OpenGL path
+/// failed" looks like from the launcher. Here a failed match is retried with progressively
+/// plainer requirements, and every retry is logged, so a working context is found when one
+/// exists and a bug report names the list that finally matched.
+#[no_mangle]
+pub unsafe extern "C" fn eglChooseConfig(
+    dpy: *mut c_void,
+    attrib: *const i32,
+    configs: *mut *mut c_void,
+    config_size: i32,
+    num: *mut i32,
+) -> u32 {
+    type F = unsafe extern "C" fn(*mut c_void, *const i32, *mut *mut c_void, i32, *mut i32) -> u32;
+    let Some(f) = egl_sym::<F>(b"eglChooseConfig\0") else {
+        return 0; // EGL_FALSE: nothing to call
+    };
+    let asked = if attrib.is_null() { Vec::new() } else { read_attrib_list(attrib) };
+    let mut step = 0usize;
+    loop {
+        let list = if step == 0 {
+            asked.clone()
+        } else {
+            match relax_config_attribs(&asked, step) {
+                Some(list) => list,
+                None => break,
+            }
+        };
+        let ptr = if list.is_empty() {
+            std::ptr::null()
+        } else {
+            list.as_ptr()
+        };
+        let matched = f(dpy, ptr, configs, config_size, num);
+        let count = if num.is_null() { -1 } else { *num };
+        if matched != 0 && count > 0 {
+            if step > 0 {
+                log(&format!(
+                    "[GLBridge] eglChooseConfig: the requested config matched nothing; retry {step} matched {count}"
+                ));
+            }
+            return matched;
+        }
+        log(&format!("[GLBridge] eglChooseConfig: step {step} matched {count} configs"));
+        step += 1;
+    }
+    log("[GLBridge] eglChooseConfig: no config matched, even with the list relaxed");
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglCreateContext(
+    dpy: *mut c_void,
+    config: *mut c_void,
+    share: *mut c_void,
+    attrib: *const i32,
+) -> *mut c_void {
+    type F = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *const i32) -> *mut c_void;
+    let asked = read_attrib_list(attrib);
+    let (normalized, changed) = normalize_context_attribs(&asked, BOUND_API.load(Ordering::Relaxed));
+    let list = if changed { normalized } else { asked.clone() };
+    let ptr = if list.is_empty() {
+        std::ptr::null()
+    } else {
+        list.as_ptr()
+    };
+    let ctx = match egl_sym::<F>(b"eglCreateContext\0") {
+        Some(f) => f(dpy, config, share, ptr),
+        None => std::ptr::null_mut(),
+    };
+    if ctx.is_null() && changed {
+        // The rewrite is the only thing that differs from what the caller asked for; if
+        // the driver still refuses, try the original list before giving up.
+        log("[GLBridge] normalised context attributes were refused; retrying verbatim");
+        let original = if asked.is_empty() { std::ptr::null() } else { asked.as_ptr() };
+        if let Some(f) = egl_sym::<F>(b"eglCreateContext\0") {
+            let ctx = f(dpy, config, share, original);
+            if !ctx.is_null() {
+                return ctx;
+            }
+        }
+    }
+    if ctx.is_null() {
+        // Last resorts, in order: the shortest list an ES driver accepts, then no list at
+        // all. A driver that refuses both has refused the config, not the attributes, and
+        // the log above says which config it was given.
+        for version in [3i32, 2i32] {
+            let minimal = [EGL_CONTEXT_VERSION, version, EGL_NONE];
+            if let Some(f) = egl_sym::<F>(b"eglCreateContext\0") {
+                let ctx = f(dpy, config, share, minimal.as_ptr());
+                if !ctx.is_null() {
+                    log(&format!(
+                        "[GLBridge] eglCreateContext: succeeded with a minimal ES {version} attribute list"
+                    ));
+                    return ctx;
+                }
+            }
+        }
+        if let Some(f) = egl_sym::<F>(b"eglCreateContext\0") {
+            let ctx = f(dpy, config, share, std::ptr::null());
+            if !ctx.is_null() {
+                log("[GLBridge] eglCreateContext: succeeded with no attribute list");
+                return ctx;
+            }
+        }
+        log("[GLBridge] eglCreateContext: refused every attribute list tried");
+    }
+    if changed && !ctx.is_null() {
+        log("[GLBridge] eglCreateContext: desktop-GL attributes rewritten to ES 3");
+    }
+    ctx
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglBindAPI(api: u32) -> u32 {
+    type F = unsafe extern "C" fn(u32) -> u32;
+    // Only ES contexts exist here, so a desktop-GL bind is answered with an ES bind and
+    // remembered as what was asked.
+    let asked = if api == EGL_OPENGL_API { EGL_OPENGL_ES_API } else { api };
+    let result = match egl_sym::<F>(b"eglBindAPI\0") {
+        Some(f) => f(asked),
+        None => 0x3000, // EGL_NOT_INITIALIZED
+    };
+    BOUND_API.store(api, Ordering::Relaxed);
+    if api == EGL_OPENGL_API {
+        log("[GLBridge] eglBindAPI(OPENGL_API) -> bound ES: no desktop GL on Android");
+    }
+    result
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglQueryAPI() -> u32 {
+    type F = unsafe extern "C" fn() -> u32;
+    let bound = BOUND_API.load(Ordering::Relaxed);
+    if bound == EGL_OPENGL_API {
+        // Report what the caller bound: it has to recognise its own context.
+        return EGL_OPENGL_API;
+    }
+    match egl_sym::<F>(b"eglQueryAPI\0") {
+        Some(f) => f(),
+        None => bound,
+    }
+}
+
+// =============================================================================
+// EGL 1.5 / EGL_EXT_platform_base - the path SDL3 takes first
+//
+// Minecraft 26.3 replaced GLFW with SDL3 for window, input and platform integration
+// (26.3 Snapshot 4), and SDL3's EGL backend (src/video/SDL_egl.c) prefers
+// `eglGetPlatformDisplay` over `eglGetDisplay` and `eglCreatePlatformWindowSurface`
+// over `eglCreateWindowSurface` whenever the driver is EGL 1.5 or advertises
+// EGL_EXT_platform_base. It falls back to the EGL 1.4 spellings when they are missing,
+// so nothing here changes behaviour for the launchers that use EGL 1.4 - it only means
+// a 26.3-era launcher that points SDL3 at this library gets an answer instead of a null.
+//
+// Every one of these forwards to the system EGL and falls back to the older spelling
+// when the system EGL does not have it. EGLAttrib is `intptr_t` and EGL 1.4's EGLint is
+// `int`, so an attribute list has to be converted element by element; both are
+// terminated by EGL_NONE (0), which is what makes that safe.
+//
+// Not implemented: the EGL_EXT_device_enumeration family (`eglQueryDevicesEXT` and
+// friends), which SDL3 only uses for its offscreen/device-platform path, and the pixmap
+// variants - there are no pixmaps on Android, and this layer has no way to back one.
+// =============================================================================
+
+/// Copies an `EGLAttrib` list into `EGLint`s. `None` when `attribs` is null (SDL3 passes
+/// null). Walks to the `EGL_NONE` terminator, which both spellings require.
+unsafe fn egl_attribs_as_int(attribs: *const isize) -> Option<Vec<i32>> {
+    if attribs.is_null() {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut i = 0;
+    loop {
+        let v = *attribs.add(i);
+        out.push(v as i32);
+        if v == 0 {
+            return Some(out);
+        }
+        i += 1;
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglGetPlatformDisplay(
+    platform: u32,
+    native: *mut c_void,
+    attribs: *const isize,
+) -> *mut c_void {
+    type F = unsafe extern "C" fn(u32, *mut c_void, *const isize) -> *mut c_void;
+    if let Some(f) = egl_sym::<F>(b"eglGetPlatformDisplay\0") {
+        let dpy = f(platform, native, attribs);
+        if !dpy.is_null() {
+            log(&format!("[GLBridge] eglGetPlatformDisplay(0x{platform:04X}) -> system EGL"));
+            return dpy;
+        }
+    }
+    // EGL 1.4 driver: the platform is implied by the native display.
+    log(&format!("[GLBridge] eglGetPlatformDisplay(0x{platform:04X}) -> eglGetDisplay fallback"));
+    eglGetDisplay(native)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglGetPlatformDisplayEXT(
+    platform: u32,
+    native: *mut c_void,
+    attribs: *const i32,
+) -> *mut c_void {
+    type F = unsafe extern "C" fn(u32, *mut c_void, *const i32) -> *mut c_void;
+    if let Some(f) = egl_sym::<F>(b"eglGetPlatformDisplayEXT\0") {
+        let dpy = f(platform, native, attribs);
+        if !dpy.is_null() {
+            log(&format!("[GLBridge] eglGetPlatformDisplayEXT(0x{platform:04X}) -> system EGL"));
+            return dpy;
+        }
+    }
+    log(&format!(
+        "[GLBridge] eglGetPlatformDisplayEXT(0x{platform:04X}) -> eglGetDisplay fallback"
+    ));
+    eglGetDisplay(native)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglCreatePlatformWindowSurface(
+    dpy: *mut c_void,
+    config: *mut c_void,
+    native: *mut c_void,
+    attribs: *const isize,
+) -> *mut c_void {
+    type F = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *const isize) -> *mut c_void;
+    if let Some(f) = egl_sym::<F>(b"eglCreatePlatformWindowSurface\0") {
+        let s = f(dpy, config, native, attribs);
+        if !s.is_null() {
+            return s;
+        }
+    }
+    let ints = egl_attribs_as_int(attribs);
+    eglCreateWindowSurface(
+        dpy,
+        config,
+        native,
+        ints.as_ref().map(|v| v.as_ptr()).unwrap_or(std::ptr::null()),
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglCreatePlatformWindowSurfaceEXT(
+    dpy: *mut c_void,
+    config: *mut c_void,
+    native: *mut c_void,
+    attribs: *const i32,
+) -> *mut c_void {
+    type F = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *const i32) -> *mut c_void;
+    if let Some(f) = egl_sym::<F>(b"eglCreatePlatformWindowSurfaceEXT\0") {
+        let s = f(dpy, config, native, attribs);
+        if !s.is_null() {
+            return s;
+        }
+    }
+    eglCreateWindowSurface(dpy, config, native, attribs)
+}
+
+/// Damage-aware swap. SDL3 uses it when the driver has it; a plain swap is the correct
+/// answer when it does not, and ours still runs the overlay and the frame timing.
+#[no_mangle]
+pub unsafe extern "C" fn eglSwapBuffersWithDamageKHR(
+    dpy: *mut c_void,
+    surface: *mut c_void,
+    rects: *const i32,
+    n_rects: i32,
+) -> u32 {
+    type F = unsafe extern "C" fn(*mut c_void, *mut c_void, *const i32, i32) -> u32;
+    if let Some(f) = egl_sym::<F>(b"eglSwapBuffersWithDamageKHR\0") {
+        return f(dpy, surface, rects, n_rects);
+    }
+    eglSwapBuffers(dpy, surface)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglSwapBuffersWithDamageEXT(
+    dpy: *mut c_void,
+    surface: *mut c_void,
+    rects: *const i32,
+    n_rects: i32,
+) -> u32 {
+    type F = unsafe extern "C" fn(*mut c_void, *mut c_void, *const i32, i32) -> u32;
+    if let Some(f) = egl_sym::<F>(b"eglSwapBuffersWithDamageEXT\0") {
+        return f(dpy, surface, rects, n_rects);
+    }
+    eglSwapBuffersWithDamageKHR(dpy, surface, rects, n_rects)
+}
+
+// =============================================================================
+// Frame timing (`RENDERER_FRAME_STATS=1`)
+//
+// The one performance measurement this layer can take on its own: it re-exports EGL, so
+// every presented frame passes through `eglSwapBuffers` below. What it reports is where the
+// time between two presents goes - the frame interval - and how much of that was spent
+// *inside* the swap, which is where a driver waits for the GPU.
+// =============================================================================
+
+/// Intervals kept for the percentiles. 240 is ~4 s at 60 fps and ~8 s at 30 fps: long
+/// enough for a p99 to mean something, short enough to live in a fixed array.
+const FRAME_SAMPLES: usize = 240;
+/// An interval this long is a hitch - a backgrounded app, a shader compiled on the main
+/// thread - and is counted separately instead of dragging the percentiles around.
+const FRAME_HITCH_NS: u64 = 100_000_000;
+/// The 30 fps budget. That is the target on the hardware at the bottom of the range; a
+/// stable 30 beats an oscillating 45 on a phone.
+const FRAME_BUDGET_NS: u64 = 33_333_333;
+
+struct FrameRing {
+    /// Fixed arrays, filled once and overwritten: no allocation in the render loop, ever.
+    intervals: [u64; FRAME_SAMPLES],
+    /// Time spent inside `eglSwapBuffers` itself: the back-pressure signal. A driver that
+    /// has to wait for the GPU shows it here, not in the interval.
+    blocked: [u64; FRAME_SAMPLES],
+    len: usize,
+    next: usize,
+    frames: u64,
+    last_swap: Option<Instant>,
+}
+
+impl FrameRing {
+    const fn new() -> Self {
+        Self {
+            intervals: [0; FRAME_SAMPLES],
+            blocked: [0; FRAME_SAMPLES],
+            len: 0,
+            next: 0,
+            frames: 0,
+            last_swap: None,
+        }
+    }
+
+    fn push(&mut self, interval: u64, blocked: u64) {
+        self.intervals[self.next] = interval;
+        self.blocked[self.next] = blocked;
+        self.next = (self.next + 1) % FRAME_SAMPLES;
+        if self.len < FRAME_SAMPLES {
+            self.len += 1;
+        }
+        self.frames += 1;
+    }
+
+    /// The samples recorded so far, in arrival order; percentiles do not care about order.
+    fn samples(&self) -> (&[u64], &[u64]) {
+        (&self.intervals[..self.len], &self.blocked[..self.len])
+    }
+}
+
+static FRAME_STATS: Mutex<FrameRing> = Mutex::new(FrameRing::new());
+
+/// Read once: the enabled check on the hot path is a load and a branch.
+fn frame_stats_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("RENDERER_FRAME_STATS").as_deref(), Ok("1")))
+}
+
+/// Nearest-rank percentile of a sorted, non-empty slice: p50 of ten samples is the fifth.
+/// Simple and stable enough to compare two runs, which is what it is for.
+fn percentile(sorted: &[u64], pct: usize) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let rank = ((sorted.len() * pct + 99) / 100).max(1).min(sorted.len());
+    sorted[rank - 1]
+}
+
+struct FrameSummary {
+    frames: usize,
+    p50_ns: u64,
+    p95_ns: u64,
+    p99_ns: u64,
+    blocked_p50_ns: u64,
+    blocked_p95_ns: u64,
+    over_budget: usize,
+    hitches: usize,
+}
+
+fn summarize(ring: &FrameRing) -> Option<FrameSummary> {
+    let (intervals, blocked) = ring.samples();
+    if intervals.is_empty() {
+        return None;
+    }
+    let mut intervals = intervals.to_vec();
+    intervals.sort_unstable();
+    let mut blocked = blocked.to_vec();
+    blocked.sort_unstable();
+    Some(FrameSummary {
+        frames: intervals.len(),
+        p50_ns: percentile(&intervals, 50),
+        p95_ns: percentile(&intervals, 95),
+        p99_ns: percentile(&intervals, 99),
+        blocked_p50_ns: percentile(&blocked, 50),
+        blocked_p95_ns: percentile(&blocked, 95),
+        over_budget: intervals.iter().filter(|t| **t > FRAME_BUDGET_NS).count(),
+        hitches: intervals.iter().filter(|t| **t > FRAME_HITCH_NS).count(),
+    })
+}
+
+#[cold]
+#[inline(never)]
+fn report_frame_stats(ring: &FrameRing) {
+    let Some(summary) = summarize(ring) else {
+        return;
+    };
+    let fps = if summary.p50_ns > 0 {
+        1e9 / summary.p50_ns as f64
+    } else {
+        0.0
+    };
+    let ms = |ns: u64| ns as f64 / 1e6;
+    log(&format!(
+        "[FrameStats] {} frames ({} since start): p50 {:.1}ms ({:.1} fps) p95 {:.1}ms p99 {:.1}ms \
+         | swap wait p50 {:.1}ms p95 {:.1}ms | over 33.3ms: {} ({:.0}%) | hitches >100ms: {}",
+        summary.frames,
+        ring.frames,
+        ms(summary.p50_ns),
+        fps,
+        ms(summary.p95_ns),
+        ms(summary.p99_ns),
+        ms(summary.blocked_p50_ns),
+        ms(summary.blocked_p95_ns),
+        summary.over_budget,
+        100.0 * summary.over_budget as f64 / summary.frames as f64,
+        summary.hitches,
+    ));
+}
+
+/// Called with the instant the swap was entered; the first frame only sets the baseline.
+fn record_frame(entered: Instant) {
+    let blocked = Instant::now().saturating_duration_since(entered).as_nanos() as u64;
+    let mut ring = FRAME_STATS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(last) = ring.last_swap {
+        let interval = entered.saturating_duration_since(last).as_nanos() as u64;
+        ring.push(interval, blocked);
+        if ring.frames % FRAME_SAMPLES as u64 == 0 {
+            report_frame_stats(&ring);
+        }
+    }
+    ring.last_swap = Some(entered);
+}
+
+/// Custom `eglSwapBuffers` that draws the debug overlay before presenting.
+#[no_mangle]
+pub unsafe extern "C" fn eglSwapBuffers(dpy: *mut c_void, surface: *mut c_void) -> u32 {
+    let timed = frame_stats_enabled();
+    let entered = if timed { Some(Instant::now()) } else { None };
+    // Draw overlay if enabled.
+    if overlay::is_enabled() {
+        let cfg = renderer_core::Config::from_env();
+        let be = crate::backend().map(|b| b as &dyn renderer_core::Backend);
+        overlay::draw(&cfg, be);
+    }
+    // Forward to system EGL.
+    type F = unsafe extern "C" fn(*mut c_void, *mut c_void) -> u32;
+    let presented = match egl_sym::<F>(b"eglSwapBuffers\0") {
+        Some(f) => f(dpy, surface),
+        None => 0x3001, // EGL_NOT_INITIALIZED
+    };
+    if let Some(entered) = entered {
+        record_frame(entered);
+    }
+    presented
+}
+
+// =============================================================================
+// Telling LWJGL where this library is
+// =============================================================================
+//
+// org.lwjgl.opengl.GL loads its function provider by dlopen-ing "libGLX.so.0",
+// "libGL.so.1" and "libGL.so" - desktop names that do not exist on Android - and
+// when all of them fail it throws. A SONAME of libGL.so does not rescue it: this
+// library is loaded from Java, so it lands in a different linker namespace than
+// the dlopen LWJGL performs, and namespace-scoped soname lookup does not see it.
+//
+// What does work is an absolute path. LWJGL checks that first:
+//
+//     // METHOD 1: absolute path
+//     if (Paths.get(name).isAbsolute()) { return apiCreateLibrary(name); }
+//
+// so setting the org.lwjgl.opengl.libname system property to our own path makes
+// the very first attempt succeed, with no search at all. JNI_OnLoad runs while
+// the launcher is loading us - before any LWJGL class exists, which is the only
+// moment the property can still be set from in here.
+//
+// Every step is null-checked and the whole thing is wrapped in catch_unwind:
+// if any of it fails, the property is simply left alone and the behaviour is
+// exactly what it was before.
+
+const JNI_OK: i32 = 0;
+const JNI_VERSION_1_6: i32 = 0x0001_0006;
+
+// Indices into the JNI function tables, which are arrays of pointers. JNIEnv is
+// a pointer to the table itself, and JavaVM is a pointer to a pointer to it.
+const JNI_GET_ENV: usize = 6;
+const JNI_FIND_CLASS: usize = 6;
+const JNI_EXCEPTION_OCCURRED: usize = 15;
+const JNI_EXCEPTION_CLEAR: usize = 17;
+const JNI_DELETE_LOCAL_REF: usize = 23;
+const JNI_GET_STATIC_METHOD_ID: usize = 113;
+const JNI_CALL_STATIC_OBJECT_METHOD_A: usize = 116;
+const JNI_NEW_STRING_UTF: usize = 167;
+const JNI_GET_STRING_UTF_CHARS: usize = 169;
+const JNI_RELEASE_STRING_UTF_CHARS: usize = 170;
+
+/// `jvalue`: a union of pointer-sized values, passed as an array to the `...A` calls.
+#[repr(C)]
+struct JniValue {
+    data: u64,
+}
+
+/// Entry `index` of a JNI function table. Null when the table is unusable, so every
+/// caller can simply check and give up.
+unsafe fn jni_fn(table: *mut *mut c_void, index: usize) -> *mut c_void {
+    if table.is_null() {
+        return std::ptr::null_mut();
+    }
+    let base = *table as *mut *mut c_void;
+    if base.is_null() {
+        return std::ptr::null_mut();
+    }
+    *base.add(index)
+}
+
+/// The absolute path of the file this code is running from, read from `/proc/self/maps`.
+///
+/// `dladdr` would do, but its `Dl_info` layout differs between libcs, and getting it
+/// wrong in a function that runs during library load is not worth the risk. The maps
+/// file is stable, needs no libc declaration, and is readable everywhere.
+static PATH_LOOKUP_MARKER: u8 = 0;
+
+fn this_library_path() -> Option<String> {
+    // The address of a static in this crate, rather than of a function: casting a
+    // function item to a data pointer is not something Rust allows you to write.
+    let here = &PATH_LOOKUP_MARKER as *const u8 as usize;
+    let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+    for line in maps.lines() {
+        let mut fields = line.split_whitespace();
+        let range = fields.next()?;
+        let mut bounds = range.split('-');
+        let start = usize::from_str_radix(bounds.next()?, 16).ok()?;
+        let end = usize::from_str_radix(bounds.next()?, 16).ok()?;
+        if !(start..end).contains(&here) {
+            continue;
+        }
+        // Everything after the inode is the pathname; it may contain spaces.
+        let path = line.splitn(6, ' ').nth(5)?.trim_start().trim();
+        if path.ends_with(".so") {
+            return Some(path.to_string());
+        }
+    }
+    None
+}
+
+/// Sets `org.lwjgl.opengl.libname` (and the EGL one) to our own path, unless something
+/// has already chosen a GL library.
+unsafe fn publish_library_path(vm: *mut *mut c_void) {
+    type GetEnvFn = unsafe extern "C" fn(*mut *mut c_void, *mut *mut c_void, i32) -> i32;
+    type FindClassFn = unsafe extern "C" fn(*mut *mut c_void, *const c_char) -> *mut c_void;
+    type ExceptionFn = unsafe extern "C" fn(*mut *mut c_void) -> *mut c_void;
+    type ClearFn = unsafe extern "C" fn(*mut *mut c_void);
+    type DeleteFn = unsafe extern "C" fn(*mut *mut c_void, *mut c_void);
+    type MethodIdFn =
+        unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const c_char, *const c_char) -> *mut c_void;
+    type CallStaticFn =
+        unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *mut c_void, *const JniValue) -> *mut c_void;
+    type NewStringFn = unsafe extern "C" fn(*mut *mut c_void, *const c_char) -> *mut c_void;
+    type GetCharsFn = unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *mut u8) -> *const c_char;
+    type ReleaseCharsFn = unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const c_char);
+
+    let get_env: GetEnvFn = std::mem::transmute(jni_fn(vm, JNI_GET_ENV));
+    let mut raw_env: *mut c_void = std::ptr::null_mut();
+    if get_env(vm, &mut raw_env, JNI_VERSION_1_6) != JNI_OK || raw_env.is_null() {
+        log("[GLBridge] publish: JNI GetEnv unavailable; leaving the LWJGL library name alone");
+        return;
+    }
+    let env = raw_env as *mut *mut c_void;
+
+    let find_class: FindClassFn = std::mem::transmute(jni_fn(env, JNI_FIND_CLASS));
+    let occurred: ExceptionFn = std::mem::transmute(jni_fn(env, JNI_EXCEPTION_OCCURRED));
+    let clear: ClearFn = std::mem::transmute(jni_fn(env, JNI_EXCEPTION_CLEAR));
+    let delete: DeleteFn = std::mem::transmute(jni_fn(env, JNI_DELETE_LOCAL_REF));
+    let method_id: MethodIdFn = std::mem::transmute(jni_fn(env, JNI_GET_STATIC_METHOD_ID));
+    let call_static: CallStaticFn = std::mem::transmute(jni_fn(env, JNI_CALL_STATIC_OBJECT_METHOD_A));
+    let new_string: NewStringFn = std::mem::transmute(jni_fn(env, JNI_NEW_STRING_UTF));
+    let get_chars: GetCharsFn = std::mem::transmute(jni_fn(env, JNI_GET_STRING_UTF_CHARS));
+    let release_chars: ReleaseCharsFn = std::mem::transmute(jni_fn(env, JNI_RELEASE_STRING_UTF_CHARS));
+
+    // A function pointer cannot be cast straight to a data pointer, so null is tested
+    // through its address instead.
+    if [find_class as usize, occurred as usize, clear as usize, delete as usize,
+        method_id as usize, call_static as usize, new_string as usize, get_chars as usize,
+        release_chars as usize]
+        .iter()
+        .any(|address| *address == 0)
+    {
+        log("[GLBridge] publish: the JNI table is missing entries; leaving the name alone");
+        return;
+    }
+
+    let system = find_class(env, c"java/lang/System".as_ptr());
+    if system.is_null() {
+        let _ = occurred(env);
+        clear(env);
+        log("[GLBridge] publish: java/lang/System not found");
+        return;
+    }
+    let get_property = method_id(
+        env,
+        system,
+        c"getProperty".as_ptr(),
+        c"(Ljava/lang/String;)Ljava/lang/String;".as_ptr(),
+    );
+    let set_property = method_id(
+        env,
+        system,
+        c"setProperty".as_ptr(),
+        c"(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;".as_ptr(),
+    );
+    if get_property.is_null() || set_property.is_null() {
+        let _ = occurred(env);
+        clear(env);
+        log("[GLBridge] publish: System.getProperty/setProperty not found");
+        return;
+    }
+
+    let path = match this_library_path() {
+        Some(path) => path,
+        None => {
+            log("[GLBridge] publish: could not work out our own path from /proc/self/maps");
+            return;
+        }
+    };
+
+    for key in [c"org.lwjgl.opengl.libname", c"org.lwjgl.egl.libname"] {
+        let key_str = new_string(env, key.as_ptr());
+        if key_str.is_null() {
+            continue;
+        }
+        let args = [JniValue { data: key_str as u64 }];
+        let current = call_static(env, system, get_property, args.as_ptr());
+        let already_set = if current.is_null() {
+            false
+        } else {
+            let chars = get_chars(env, current, std::ptr::null_mut());
+            let set = !chars.is_null()
+                && !std::ffi::CStr::from_ptr(chars).to_str().unwrap_or("").is_empty();
+            if !chars.is_null() {
+                release_chars(env, current, chars);
+            }
+            set
+        };
+        delete(env, current);
+        if already_set {
+            log(&format!("[GLBridge] publish: {} is already set; not overriding it",
+                key.to_str().unwrap_or("?")));
+            delete(env, key_str);
+            continue;
+        }
+        let value = match std::ffi::CString::new(path.as_str()) {
+            Ok(value) => new_string(env, value.as_ptr()),
+            Err(_) => std::ptr::null_mut(),
+        };
+        if value.is_null() {
+            delete(env, key_str);
+            continue;
+        }
+        let args = [JniValue { data: key_str as u64 }, JniValue { data: value as u64 }];
+        let previous = call_static(env, system, set_property, args.as_ptr());
+        delete(env, previous);
+        delete(env, value);
+        delete(env, key_str);
+        log(&format!("[GLBridge] publish: {} = {path}", key.to_str().unwrap_or("?")));
+    }
+}
+
+/// Runs when a launcher loads this library from Java with `System.load`. Nothing here is
+/// allowed to fail the load: the worst case is that the property is not set, which is the
+/// behaviour of every build before this one.
+#[no_mangle]
+pub extern "C" fn JNI_OnLoad(vm: *mut c_void, _reserved: *mut c_void) -> i32 {
+    if std::env::var("RENDERER_PUBLISH_PATH").as_deref() == Ok("0") {
+        return JNI_VERSION_1_6;
+    }
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        publish_library_path(vm as *mut *mut c_void)
+    }));
+    if outcome.is_err() {
+        log("[GLBridge] JNI_OnLoad: publishing the library path panicked; ignored");
+    }
+    JNI_VERSION_1_6
+}
+
+/// eglGetProcAddress: our GL symbols first, then system EGL.
+#[no_mangle]
+pub unsafe extern "C" fn eglGetProcAddress(name: *const c_char) -> *const c_void {
+    if name.is_null() {
+        return std::ptr::null();
+    }
+    let n = unsafe { CStr::from_ptr(name) }.to_bytes();
+    let ours = resolve_proc(n);
+    if !ours.is_null() {
+        return ours;
+    }
+    // System extension lookup
+    type F = unsafe extern "C" fn(*const c_char) -> *const c_void;
+    match egl_sym::<F>(b"eglGetProcAddress\0") {
+        Some(f) => f(name),
+        None => std::ptr::null(),
+    }
+}
+
+
+// =============================================================================
+// Mesa DRI stubs — Zalith may set LIB_MESA_NAME to our .so when the V2 plugin
+// is not counted as selectedRendererPlugin. Returning null extensions avoids
+// a hard crash inside the Mesa loader.
+// =============================================================================
+
+#[no_mangle]
+pub extern "C" fn __driDriverGetExtensions() -> *const *const c_void {
+    log("[GLBridge] __driDriverGetExtensions stub (not a Mesa driver)");
+    std::ptr::null()
+}
+
+#[no_mangle]
+pub extern "C" fn __driDriverGetExtensions_zink() -> *const *const c_void {
+    __driDriverGetExtensions()
+}
+
+#[no_mangle]
+pub extern "C" fn __driDriverGetExtensions_virtio_gpu() -> *const *const c_void {
+    __driDriverGetExtensions()
+}
+
+#[cfg(test)]
+mod tests {
+    /// Mali reports `0:15` relative to `#line 3 0` after an imported block; the excerpt must
+    /// land on the physical line that follows the directive, not on physical line 15.
+    #[test]
+    fn error_line_follows_line_directives() {
+        let src = "#version 300 es\n#line 0 1\nimported_a\nimported_b\n#line 3 0\nmain_3\nmain_4\n";
+        assert_eq!(physical_line_for_error(src, 0, 3), Some(6));
+        assert_eq!(physical_line_for_error(src, 0, 4), Some(7));
+        assert_eq!(physical_line_for_error(src, 1, 0), Some(3));
+        assert_eq!(physical_line_for_error(src, 0, 99), None);
+        assert_eq!(shader_error_location("0:15: S0001: oops"), Some((0, 15)));
+    }
+
+    use super::*;
+
+    #[test]
+    fn shader_diagnostic_failure_is_logged_once_until_object_reuse() {
+        let seen = Mutex::new(Vec::new());
+        assert!(log_failure_once(&seen, 17));
+        assert!(!log_failure_once(&seen, 17));
+        clear_logged_failure(&seen, 17);
+        assert!(log_failure_once(&seen, 17));
+    }
+
+    /// Serialises tests that touch process-global state -- the driver entry-point cache and
+    /// the merged extension list. They raced once a new test began resolving names, which made
+    /// an unrelated cache assertion fail intermittently.
+    pub(crate) fn global_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn name_of(entry: &[u8]) -> &[u8] {
+        entry.strip_suffix(&[0u8]).unwrap_or(entry)
+    }
+
+    /// The eglChooseConfig fallback has to give up one requirement at a time, and has to
+    /// stop: a driver that matched nothing must not be asked the same question forever.
+    #[test]
+    fn config_attribs_relax_one_step_at_a_time() {
+        let asked = [
+            EGL_SURFACE_TYPE, 0x0004,      // EGL_WINDOW_BIT
+            EGL_RENDERABLE_TYPE, 0x0040,   // EGL_OPENGL_ES3_BIT_KHR
+            0x3024, 8,                     // EGL_RED_SIZE
+            EGL_DEPTH_SIZE, 24,
+            EGL_STENCIL_SIZE, 8,
+            EGL_SAMPLE_BUFFERS, 1,
+            EGL_NONE,
+        ];
+        let one = relax_config_attribs(&asked, 1).expect("step 1 relaxes something");
+        assert!(!one.windows(2).any(|pair| pair[0] == EGL_STENCIL_SIZE
+            || pair[0] == EGL_SAMPLE_BUFFERS), "{one:?}");
+        assert!(one.windows(2).any(|pair| pair[0] == EGL_DEPTH_SIZE && pair[1] == 24),
+            "depth is not the first thing to give up: {one:?}");
+
+        let two = relax_config_attribs(&asked, 2).expect("step 2 relaxes more");
+        assert!(two.windows(2).any(|pair| pair[0] == EGL_DEPTH_SIZE && pair[1] == 16),
+            "depth is clamped to 16 at step 2: {two:?}");
+
+        let three = relax_config_attribs(&asked, 3).expect("step 3 keeps the requirements");
+        assert_eq!(three, vec![EGL_SURFACE_TYPE, 0x0004, EGL_RENDERABLE_TYPE, 0x0040, EGL_NONE]);
+
+        assert!(relax_config_attribs(&asked, 4).is_none(), "there is nothing left to relax");
+        assert!(relax_config_attribs(&[EGL_NONE], 1).is_none(), "an empty list cannot be relaxed");
+        assert_eq!(relax_config_attribs(&asked, 1).unwrap().last(), Some(&EGL_NONE),
+            "every list stays terminated");
+    }
+
+    /// The path lookup runs during library load, where a panic would fail the load. It has
+    /// to answer without panicking from a process that is not a shared library at all.
+    #[test]
+    fn this_library_path_answers_without_panicking() {
+        match this_library_path() {
+            Some(path) => assert!(path.ends_with(".so"), "a library path was {path}"),
+            None => {} // a test binary is not a .so, so this is the expected answer here
+        }
+    }
+
+    #[test]
+    fn minecraft_gpu_identity_uses_rustgl_brand() {
+        let (vendor, renderer) = renderer_identity();
+        assert_eq!(vendor.to_bytes(), b"WhalterMC");
+        // The ES version in the renderer string is the one the driver reported, so it is
+        // checked for shape rather than pinned to 3.2.
+        let renderer = renderer.to_bytes();
+        assert!(renderer.starts_with(b"OpenGL ES "), "renderer was {renderer:?}");
+        assert!(renderer.ends_with(b" RustGL"), "renderer was {renderer:?}");
+    }
+
+    /// The claim has to follow the driver: a constant 4.5 is what made an ES 3.0 driver
+    /// fail on features it cannot back.
+    #[test]
+    fn claimed_gl_version_follows_the_driver_underneath() {
+        let caps = crate::gles3::caps();
+        let expected: (i32, i32, &str, &str) = if !caps.valid {
+            (4, 5, "4.5 (Core Profile) RustGL", "4.50")
+        } else {
+            match (caps.es_major, caps.es_minor) {
+                (major, minor) if (major, minor) >= (3, 2) => {
+                    (4, 5, "4.5 (Core Profile) RustGL", "4.50")
+                }
+                (3, 1) => (4, 3, "4.3 (Core Profile) RustGL", "4.30"),
+                (3, _) => (3, 3, "3.3 (Core Profile) RustGL", "3.30"),
+                _ => (2, 1, "2.1 RustGL", "1.20"),
+            }
+        };
+        let (major, minor, version, glsl) = claimed_version();
+        assert_eq!((major, minor), (expected.0, expected.1));
+        assert_eq!(CStr::from_bytes_until_nul(version).unwrap().to_bytes(),
+                   expected.2.as_bytes());
+        assert_eq!(CStr::from_bytes_until_nul(glsl).unwrap().to_bytes(),
+                   expected.3.as_bytes());
+        // What the game reads back has to agree with the string it is shown.
+        let mut queried_major = 0;
+        let mut queried_minor = 0;
+        unsafe {
+            glGetIntegerv(GL_MAJOR_VERSION, &mut queried_major);
+            glGetIntegerv(GL_MINOR_VERSION, &mut queried_minor);
+        }
+        assert_eq!((queried_major, queried_minor), (major, minor));
+    }
+
+    /// One representative entry point per advertised extension. Claiming an extension
+    /// makes a client bind the call it advertises; if the layer resolves that symbol to
+    /// null, the probe succeeded and the call crashes. `GL_KHR_debug` used to fail this.
+    const ADVERTISED_ENTRY_POINTS: &[(&str, &[&str])] = &[
+        ("GL_ARB_vertex_array_object", &["glGenVertexArrays", "glBindVertexArray", "glDeleteVertexArrays"]),
+        ("GL_ARB_explicit_attrib_location", &["glBindAttribLocation", "glGetAttribLocation"]),
+        ("GL_ARB_explicit_uniform_location", &["glGetUniformLocation"]),
+        ("GL_ARB_instanced_arrays", &["glVertexAttribDivisor", "glDrawArraysInstanced"]),
+        ("GL_ARB_draw_instanced", &["glDrawArraysInstanced", "glDrawElementsInstanced"]),
+        ("GL_ARB_uniform_buffer_object", &["glBindBufferBase", "glBindBufferRange", "glGetUniformBlockIndex", "glUniformBlockBinding"]),
+        ("GL_ARB_map_buffer_range", &["glMapBufferRange", "glFlushMappedBufferRange"]),
+        ("GL_ARB_framebuffer_object", &["glGenFramebuffers", "glBindFramebuffer", "glFramebufferTexture2D", "glGenRenderbuffers"]),
+        ("GL_ARB_texture_storage", &["glTexStorage2D", "glTexStorage3D"]),
+        ("GL_ARB_copy_buffer", &["glCopyBufferSubData"]),
+        ("GL_ARB_sync", &["glFenceSync", "glClientWaitSync", "glDeleteSync", "glWaitSync"]),
+        ("GL_ARB_sampler_objects", &["glGenSamplers", "glBindSampler", "glIsSampler"]),
+        ("GL_ARB_half_float_pixel", &["glTexImage2D", "glRenderbufferStorage"]),
+        ("GL_ARB_half_float_vertex", &["glVertexAttribPointer"]),
+        ("GL_ARB_vertex_type_2_10_10_10_rev", &["glVertexAttribP1ui", "glVertexAttribP4uiv"]),
+        ("GL_ARB_multi_bind", &["glBindTextureUnit"]),
+        ("GL_ARB_get_program_binary", &["glGetProgramBinary", "glProgramBinary"]),
+        ("GL_ARB_direct_state_access", &["glGetTextureParameteriv", "glGetTextureImage", "glGetTextureLevelParameteriv"]),
+        ("GL_KHR_robustness", &["glGetGraphicsResetStatus", "glReadnPixels", "glGetnUniformfv"]),
+        ("GL_ARB_clip_control", &["glClipControl"]),
+        ("GL_ARB_texture_barrier", &["glTextureBarrier"]),
+        ("GL_ARB_program_interface_query", &["glGetProgramInterfaceiv", "glGetProgramResourceIndex", "glGetProgramResourceName"]),
+        ("GL_EXT_texture_filter_anisotropic", &["glTexParameterf", "glTexParameteri"]),
+        ("GL_OES_element_index_uint", &["glDrawElements", "glDrawElementsBaseVertex"]),
+        ("GL_EXT_color_buffer_float", &["glTexImage2D", "glRenderbufferStorage"]),
+        ("GL_EXT_color_buffer_half_float", &["glTexImage2D", "glRenderbufferStorage"]),
+        ("GL_EXT_texture_format_BGRA8888", &["glTexImage2D", "glTexSubImage2D", "glRenderbufferStorage"]),
+        ("GL_ARB_multitexture", &["glActiveTexture"]),
+        ("GL_EXT_texture_array", &["glTexImage3D", "glFramebufferTextureLayer"]),
+    ];
+
+    /// Advertised extensions that add **no entry point at all**: they are part of the
+    /// shading language or of the texture format list, so the only thing a client can
+    /// do with them is compile a shader that uses them. OptiFine turns every advertised
+    /// name into the `MC_GL_<ext>` macro its shaders test with `#ifdef`, so these have
+    /// to be advertised for a pack to take its real code path - and there is nothing to
+    /// resolve, which is exactly why the table above cannot hold them.
+    const GLSL_OR_FORMAT_ONLY_EXTENSIONS: &[(&str, &str)] = &[
+        ("GL_ARB_shader_texture_lod", "GLSL only: texture2DLod / texture2DGradARB"),
+        ("GL_EXT_shader_texture_lod", "GLSL only: the ES spelling of the same extension"),
+        ("GL_ARB_depth_texture", "formats only: depth textures are created with glTexImage2D"),
+        ("GL_ARB_shadow", "GLSL and TexParameter only: sampler2DShadow and TEXTURE_COMPARE_MODE"),
+        ("GL_ARB_texture_float", "formats only: float internal formats for glTexImage2D"),
+        ("GL_ARB_color_buffer_half_float", "formats only: renderable half-float formats"),
+    ];
+
+    #[test]
+    fn every_advertised_extension_exports_its_entry_points() {
+        // Aliases are now capability-filtered, so "advertised" depends on the probed device.
+        // With no GL context the probe is invalid and only the always-on set is offered;
+        // check the entry points for whatever is actually advertised, and additionally
+        // require the always-on set to be present unconditionally.
+        let advertised_now: Vec<&[u8]> = compat_extensions();
+        let stub = legacy_noop_fn as *const c_void;
+        for (ext, entry_points) in ADVERTISED_ENTRY_POINTS {
+            for entry in *entry_points {
+                let resolved = resolve_proc(entry.as_bytes());
+                assert!(!resolved.is_null(), "{ext} may be advertised but {entry} resolves to null");
+                assert_ne!(resolved, stub, "{ext} may be advertised but {entry} resolves to the no-op stub");
+            }
+        }
+        // Whatever we did advertise must have a backing entry point, and every always-on
+        // alias must be advertised even with no context.
+        for ext in ADVERTISED_ENTRY_POINTS {
+            let is_always_on = gles3::supported_aliases(&gles3::GlesCapabilities {
+                valid: true,
+                ..Default::default()
+            })
+            .iter()
+            .any(|e| name_of(e) == ext.0.as_bytes());
+            if is_always_on {
+                assert!(
+                    advertised_now.iter().any(|e| name_of(e) == ext.0.as_bytes()),
+                    "{} should be advertised unconditionally",
+                    ext.0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn advertised_list_is_covered_by_the_entry_point_table() {
+        for ext in compat_extensions() {
+            let name = name_of(ext);
+            let listed = ADVERTISED_ENTRY_POINTS
+                .iter()
+                .any(|(e, _)| e.as_bytes() == name);
+            let has_no_entry_points = GLSL_OR_FORMAT_ONLY_EXTENSIONS
+                .iter()
+                .any(|(e, _)| e.as_bytes() == name);
+            assert!(
+                listed || has_no_entry_points,
+                "{} is advertised without a tested entry point in ADVERTISED_ENTRY_POINTS",
+                String::from_utf8_lossy(name)
+            );
+        }
+    }
+
+    /// An extension belongs to one table or the other, never both: listing entry points
+    /// for a shading-language extension would mean inventing a call the client would
+    /// then bind, and listing one that has real functions as "nothing to resolve" would
+    /// let a null pointer through the check above.
+    #[test]
+    fn the_two_extension_tables_do_not_overlap() {
+        for (ext, _) in GLSL_OR_FORMAT_ONLY_EXTENSIONS {
+            assert!(
+                !ADVERTISED_ENTRY_POINTS
+                    .iter()
+                    .any(|(e, _)| e == ext),
+                "{ext} is listed as having no entry points but is also in ADVERTISED_ENTRY_POINTS"
+            );
+        }
+    }
+
+    #[test]
+    fn frame_percentiles_are_nearest_rank() {
+        assert_eq!(percentile(&[], 50), 0, "no samples");
+        assert_eq!(percentile(&[7], 99), 7, "one sample");
+        let s = [1u64, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        assert_eq!(percentile(&s, 50), 5);
+        assert_eq!(percentile(&s, 95), 10);
+        assert_eq!(percentile(&s, 99), 10);
+    }
+
+    #[test]
+    fn frame_ring_keeps_only_the_most_recent_samples() {
+        let mut ring = FrameRing::new();
+        for i in 1..=FRAME_SAMPLES as u64 + 10 {
+            ring.push(i * 1_000_000, 0);
+        }
+        assert_eq!(ring.len, FRAME_SAMPLES, "the window is bounded");
+        assert_eq!(ring.frames, FRAME_SAMPLES as u64 + 10, "the total is not");
+        let (intervals, _) = ring.samples();
+        assert_eq!(intervals.len(), FRAME_SAMPLES);
+        assert!(!intervals.contains(&1_000_000), "the oldest sample is gone");
+        assert!(intervals.contains(&((FRAME_SAMPLES as u64 + 10) * 1_000_000)));
+    }
+
+    #[test]
+    fn frame_summary_counts_the_frames_that_missed_the_budget() {
+        let mut ring = FrameRing::new();
+        // Nine frames inside the 30 fps budget, then one 120 ms hitch, ten times over.
+        for i in 0..100u64 {
+            let interval = if i % 10 == 0 { 120_000_000 } else { 16_000_000 };
+            ring.push(interval, 1_000_000);
+        }
+        let s = summarize(&ring).expect("samples were recorded");
+        assert_eq!(s.frames, 100);
+        assert_eq!(s.p50_ns, 16_000_000, "half the frames are on budget");
+        assert_eq!(s.over_budget, 10);
+        assert_eq!(s.hitches, 10);
+        assert_eq!(s.blocked_p50_ns, 1_000_000);
+    }
+
+    #[test]
+    fn a_stalled_frame_is_not_counted_as_a_frame() {
+        // The first swap only sets the baseline: there is no interval to report yet.
+        let mut ring = FrameRing::new();
+        assert!(summarize(&ring).is_none());
+        ring.push(16_000_000, 0);
+        assert_eq!(summarize(&ring).map(|s| s.frames), Some(1));
+    }
+
+    #[test]
+    fn egl_attribs_convert_and_stop_at_the_terminator() {
+        // SDL3 passes null when it has no attributes to specify.
+        assert!(unsafe { egl_attribs_as_int(std::ptr::null()) }.is_none());
+        // EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RED_SIZE, 8, EGL_NONE
+        let list: [isize; 5] = [0x3033, 0x0004, 0x3024, 8, 0];
+        let out = unsafe { egl_attribs_as_int(list.as_ptr()) }.expect("converted");
+        assert_eq!(out, vec![0x3033i32, 4, 0x3024, 8, 0]);
+        assert_eq!(out.last(), Some(&0), "the EGL_NONE terminator is kept");
+    }
+
+    #[test]
+    fn an_es_context_request_is_left_alone() {
+        // What every launcher builds today, and what SDL3's ES path builds: untouched.
+        let attribs = [EGL_CONTEXT_VERSION, 3, EGL_NONE];
+        let (out, changed) = normalize_context_attribs(&attribs, EGL_OPENGL_ES_API);
+        assert!(!changed);
+        assert_eq!(out, vec![EGL_CONTEXT_VERSION, 3, EGL_NONE]);
+        // Even a desktop-looking list is untouched while ES is bound: the caller knows.
+        let attribs = [EGL_CONTEXT_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 0, EGL_NONE];
+        let (_, changed) = normalize_context_attribs(&attribs, EGL_OPENGL_ES_API);
+        assert!(!changed);
+    }
+
+    #[test]
+    fn a_desktop_gl_context_request_becomes_es_3() {
+        // What Minecraft asks for on a PC, and now through SDL3: GL 3.3 core, forward
+        // compatible. No Android EGL driver accepts this list.
+        let attribs = [
+            EGL_CONTEXT_VERSION,
+            3,
+            EGL_CONTEXT_MINOR_VERSION,
+            3,
+            EGL_CONTEXT_OPENGL_PROFILE_MASK,
+            0x0001, // EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT
+            EGL_CONTEXT_FLAGS,
+            0x0002, // EGL_CONTEXT_OPENGL_FORWARD_COMPATIBLE_BIT
+            EGL_NONE,
+        ];
+        let (out, changed) = normalize_context_attribs(&attribs, EGL_OPENGL_API);
+        assert!(changed);
+        assert!(out.windows(2).any(|w| w == [EGL_CONTEXT_VERSION, 3]), "{out:?}");
+        assert!(!out.contains(&EGL_CONTEXT_MINOR_VERSION), "{out:?}");
+        assert!(!out.contains(&EGL_CONTEXT_OPENGL_PROFILE_MASK), "{out:?}");
+        assert!(!out.contains(&EGL_CONTEXT_FLAGS), "{out:?}");
+        assert_eq!(*out.last().unwrap(), EGL_NONE, "still terminated");
+    }
+
+    #[test]
+    fn a_desktop_request_without_a_version_still_gets_one() {
+        let (out, changed) = normalize_context_attribs(&[EGL_NONE], EGL_OPENGL_API);
+        assert!(changed);
+        assert_eq!(out, vec![EGL_CONTEXT_VERSION, 3, EGL_NONE]);
+    }
+
+    #[test]
+    fn attributes_that_es_accepts_survive_the_rewrite() {
+        // EGL_CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY (0x31BD) is valid for ES too.
+        let attribs = [EGL_CONTEXT_VERSION, 4, 0x31BD, 0x31BE, EGL_NONE];
+        let (out, changed) = normalize_context_attribs(&attribs, EGL_OPENGL_API);
+        assert!(changed);
+        assert!(out.windows(2).any(|w| w == [0x31BD, 0x31BE]), "{out:?}");
+    }
+
+    #[test]
+    fn push_extension_dedups_and_terminates() {
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        push_extension(&mut out, b"GL_ARB_sync");
+        push_extension(&mut out, b"GL_ARB_sync");
+        push_extension(&mut out, b"");
+        push_extension(&mut out, b"has\0nul");
+        push_extension(&mut out, b"GL_OES_element_index_uint");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], b"GL_ARB_sync\0");
+        assert_eq!(out[1], b"GL_OES_element_index_uint\0");
+        assert!(out.iter().all(|e| *e.last().unwrap() == 0));
+    }
+
+    #[test]
+    fn driver_entry_points_are_resolved_once_and_reused() {
+        let _lock = global_test_lock();
+        // The regression this guards: driver_fn used to run dlsym (plus a CString malloc)
+        // on every forwarded GL call, so a draw-heavy frame paid it per draw. The cache is
+        // keyed by the name, so repeated lookups must not re-resolve. The checks are scoped
+        // to this entry: other tests fill the same cache and run in parallel.
+        fn cached(name: &[u8]) -> Option<usize> {
+            // Scoped so the guard is released before the next lookup takes its own.
+            DRIVER_CACHE
+                .read()
+                .unwrap()
+                .as_ref()
+                .and_then(|cache| cache.get(name).copied())
+        }
+        let _ = driver_fn_cached::<unsafe extern "C" fn(u32)>("glCullFace");
+        let after_first = cached(b"glCullFace");
+        for _ in 0..1000 {
+            let _ = driver_fn_cached::<unsafe extern "C" fn(u32)>("glCullFace");
+        }
+        assert_eq!(
+            cached(b"glCullFace"),
+            after_first,
+            "repeated lookups must keep one cache entry for the name (each one is re-resolving)"
+        );
+        // A miss is not cached, so a second lookup stays a miss instead of poisoning the table.
+        // (Some stacks hand out a stub pointer for any name through eglGetProcAddress, in which
+        // case there is no miss to observe and only the one-entry invariant applies.)
+        let first = driver_fn_cached::<unsafe extern "C" fn()>("glDefinitelyNotAGLFunction");
+        let after_first_lookup = cached(b"glDefinitelyNotAGLFunction");
+        if first.is_none() {
+            assert!(after_first_lookup.is_none(), "a miss must not be cached");
+        }
+        let _ = driver_fn_cached::<unsafe extern "C" fn()>("glDefinitelyNotAGLFunction");
+        assert_eq!(
+            cached(b"glDefinitelyNotAGLFunction"),
+            after_first_lookup,
+            "a repeated lookup of one name must not add a second entry"
+        );
+    }
+
+    #[test]
+    fn clearing_the_driver_cache_forgets_every_entry() {
+        let _lock = global_test_lock();
+        driver_fn_cached::<unsafe extern "C" fn(u32)>("glCullFace");
+        clear_driver_cache();
+        let still_cached = DRIVER_CACHE
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(|cache| cache.get(&b"glCullFace"[..]).copied());
+        assert!(still_cached.is_none());
+    }
+
+    #[test]
+    fn every_exported_legacy_name_resolves_to_its_implementation() {
+        // The invariant this whole change exists for: if this layer exports a name, the
+        // resolver must hand back that implementation, never the shared no-op. Before
+        // own_symbol() existed, a measured audit found 127 exported symbols resolving to the
+        // stub and 89 unreachable through getProcAddress -- including glBegin, glVertex3f and
+        // the glColor* family, which is the fixed-function path the game draws through.
+        let stub = legacy_noop_fn as *const c_void;
+        let mut checked = 0usize;
+        let mut wrong: Vec<&str> = Vec::new();
+        for raw in LEGACY_NAMES {
+            let name = std::str::from_utf8(raw).unwrap_or("");
+            // Only names this layer actually exports can be wrong.
+            if own_symbol(raw).is_none() {
+                continue;
+            }
+            checked += 1;
+            if resolve_proc(raw) == stub {
+                wrong.push(name);
+            }
+        }
+        assert_eq!(
+            wrong.len(),
+            0,
+            "{} exported legacy names resolve to the no-op stub: {:?}",
+            wrong.len(),
+            wrong
+        );
+        // A `cargo test` binary does not export its own symbols, so the global symbol table
+        // is empty and this invariant cannot be observed there. The harness checks it against
+        // the real cdylib, where the symbols are exported; this asserts what it can.
+        assert!(
+            checked == 0 || checked > 100,
+            "expected to check most of the legacy table, saw {checked}"
+        );
+    }
+
+    #[test]
+    fn fixed_function_calls_do_not_resolve_to_the_no_op_stub() {
+        let _lock = global_test_lock();
+        // Regression guard. These are all implemented by ES 3.x and are what the 1.12-1.16
+        // fixed-function path draws through. A name can be exported *and* still resolve to the
+        // shared legacy no-op when it only appears in the stub table -- the call then silently
+        // does nothing, which is how glLightModeliv was lost. Comparing against the stub's own
+        // address catches that, where a null check would not.
+        let stub = legacy_noop_fn as *const c_void;
+        for name in [
+            "glBegin", "glEnd", "glVertex3f", "glVertex4f", "glColor3f", "glColor4f",
+            "glTexCoord2f", "glTexCoord4f", "glNormal3f", "glArrayElement", "glAlphaFunc",
+            "glShadeModel", "glPushAttrib", "glPopAttrib", "glPushClientAttrib",
+            "glPopClientAttrib", "glColorMaterial", "glTexGenfv", "glTexGenf", "glTexGeni",
+            "glTexGeniv", "glLightModeli", "glLightModeliv", "glGetTexEnvfv", "glGetTexEnviv",
+            "glGetTexGenfv", "glGetTexGeniv", "glLineStipple", "glPolygonStipple", "glFogfv",
+            "glFogf", "glFogi", "glLightfv", "glMaterialfv", "glTexEnvfv", "glTexEnvi",
+            "glMatrixMode", "glLoadMatrixf", "glPushMatrix", "glPopMatrix", "glTranslatef",
+            "glRotatef", "glScalef", "glOrtho", "glFrustum", "glVertexPointer",
+            "glColorPointer", "glTexCoordPointer", "glNormalPointer", "glEnableClientState",
+            "glDisableClientState",
+        ] {
+            let fp = resolve_proc(name.as_bytes());
+            assert!(!fp.is_null(), "{name} resolves to null");
+            assert_ne!(fp, stub, "{name} resolves to the legacy no-op stub");
+        }
+    }
+
+    #[test]
+    fn every_exported_gl_symbol_is_reachable_through_the_resolver() {
+        let _lock = global_test_lock();
+        // LWJGL resolves GL functions with eglGetProcAddress, which routes through
+        // resolve_proc. A `#[no_mangle]` function missing from every resolver table is
+        // exported but unreachable, so LWJGL binds null and the call faults. Hand-written
+        // wrappers converted out of `forward_all!` are exactly how that happens: the macro
+        // generates the resolver entry, and a replacement must add its own.
+        const HAND_WRITTEN: &[&str] = &[
+            "glGetError", "glGetString", "glGetStringi", "glGetIntegerv", "glGetBooleanv",
+            "glReadBuffer", "glClearColor",
+            "glClear", "glViewport", "glEnable", "glDisable", "glDepthRange", "glClearDepth",
+            "glTexParameteri", "glTexParameterf", "glTexParameteriv", "glTexParameterfv",
+            "glPixelStorei", "glBindBuffer", "glRenderbufferStorage", "glBufferStorage",
+            "glBufferData", "glBufferSubData", "glDeleteBuffers", "glDrawArrays",
+            "glShaderSource", "glDrawBuffer", "glMapBuffer", "glPolygonMode",
+            "glCopyImageSubData",
+        ];
+        for name in HAND_WRITTEN {
+            assert!(
+                !resolve_proc(name.as_bytes()).is_null(),
+                "{name} is exported but unreachable via eglGetProcAddress"
+            );
+        }
+    }
+
+    #[test]
+    fn unpack_state_is_tracked_without_querying_the_driver() {
+        // Default is a tight copy.
+        assert!(unpack_is_tight(), "fresh state must be tight");
+        for (set, pname) in [
+            (set_unpack_row_length as fn(i32), 0x0CF2u32),
+            (set_unpack_skip_rows, 0x0CF3),
+            (set_unpack_skip_pixels, 0x0CF4),
+        ] {
+            set(7);
+            assert!(!unpack_is_tight(), "pname 0x{pname:04X} must affect the upload path");
+            track_pixel_store(pname, 0);
+            assert!(unpack_is_tight(), "pname 0x{pname:04X} must be resettable");
+        }
+    }
+
+    #[test]
+    fn array_buffer_shadow_tracks_binding() {
+        set_array_buffer_binding(17);
+        assert_eq!(current_array_buffer(), 17);
+        // and back to default for other tests
+        set_array_buffer_binding(0);
+        assert_eq!(current_array_buffer(), 0);
+    }
+
+    #[test]
+    fn immutable_buffer_targets_resolve_to_their_binding_enums() {
+        assert_eq!(buffer_binding_pname(0x8892), Some(0x8894)); // ARRAY_BUFFER
+        assert_eq!(buffer_binding_pname(0x8893), Some(0x8895)); // ELEMENT_ARRAY_BUFFER
+        assert_eq!(buffer_binding_pname(0x8A11), Some(0x8A28)); // UNIFORM_BUFFER
+        assert_eq!(buffer_binding_pname(0x8F36), Some(0x8F36)); // COPY_READ_BUFFER
+        assert_eq!(buffer_binding_pname(0x1234), None);
+    }
+
+    #[test]
+    fn storage_flags_pick_the_matching_usage() {
+        const GL_DYNAMIC_STORAGE_BIT: u32 = 0x0100;
+        assert_eq!(storage_usage(0), 0x88E4); // static draw
+        assert_eq!(storage_usage(GL_DYNAMIC_STORAGE_BIT), 0x88E8); // dynamic draw
+    }
+
+    #[test]
+    fn immutable_buffers_are_tracked_and_released() {
+        mark_immutable(7, 0);
+        mark_immutable(7, 0);
+        assert!(is_immutable(7));
+        assert!(!is_immutable(8));
+        assert!(!immutable_allows_subdata(7));
+        assert!(immutable_allows_subdata(8));
+        mark_immutable(7, 0x0100);
+        assert!(immutable_allows_subdata(7));
+        let ids = [7u32, 8u32];
+        unsafe { glDeleteBuffers(2, ids.as_ptr()) };
+        assert!(!is_immutable(7));
+    }
+
+    #[test]
+    fn shader_translation_is_es_probes_real_driver_version() {
+        // The probe examines the driver's real GL_VERSION, not the spoofed one: ES drivers
+        // report "OpenGL ES 3.x ...", desktop drivers report "<major>.<minor> (Core Profile) ...".
+        assert!(super::probe_shader_target_is_es_for_test("OpenGL ES 3.2 Mesa 24.3"));
+        assert!(super::probe_shader_target_is_es_for_test("OpenGL ES GLX Mesa 24.3"));
+        assert!(!super::probe_shader_target_is_es_for_test("4.6 (Core Profile) Mesa 24.3"));
+        assert!(!super::probe_shader_target_is_es_for_test("4.5 (Core Profile) NVIDIA Corp"));
+        assert!(!super::probe_shader_target_is_es_for_test("4.5 (Core Profile) RustGL"));
+    }
+
+    #[test]
+    fn vertex_attrib_binding_support_uses_the_real_api_version_threshold() {
+        assert!(!version_supports_vertex_attrib_binding(true, 3, 0));
+        assert!(version_supports_vertex_attrib_binding(true, 3, 1));
+        assert!(version_supports_vertex_attrib_binding(true, 3, 2));
+        assert!(!version_supports_vertex_attrib_binding(false, 4, 2));
+        assert!(version_supports_vertex_attrib_binding(false, 4, 3));
+        assert!(version_supports_vertex_attrib_binding(false, 4, 5));
+    }
+
+    #[test]
+    fn vertex_array_binding_query_uses_the_vertex_array_enum() {
+        assert_eq!(GL_VERTEX_ARRAY_BINDING, 0x85B5);
+        assert_ne!(GL_VERTEX_ARRAY_BINDING, 0x8CA6);
+    }
+
+    #[test]
+    fn draw_buffer_query_pname_maps_only_for_es() {
+        assert_eq!(map_draw_buffer_query_pname(GL_DRAW_BUFFER, true), GL_DRAW_BUFFER0);
+        assert_eq!(map_draw_buffer_query_pname(GL_DRAW_BUFFER, false), GL_DRAW_BUFFER);
+        assert_eq!(map_draw_buffer_query_pname(GL_DRAW_BUFFER0, true), GL_DRAW_BUFFER0);
+    }
+
+    #[test]
+    fn desktop_buffer_enums_map_only_for_es_default_framebuffer() {
+        for mode in [GL_FRONT, GL_FRONT_LEFT, GL_BACK_LEFT, GL_FRONT_AND_BACK] {
+            assert_eq!(map_default_framebuffer_buffer(mode, true, 0), GL_BACK);
+            assert_eq!(map_default_framebuffer_buffer(mode, false, 0), mode);
+            assert_eq!(map_default_framebuffer_buffer(mode, true, 1), mode);
+        }
+        assert_eq!(map_default_framebuffer_buffer(0, true, 0), 0); // GL_NONE
+        assert_eq!(map_default_framebuffer_buffer(GL_BACK, true, 0), GL_BACK);
+        assert_eq!(map_default_framebuffer_buffer(0x8CE0, true, 0), 0x8CE0); // GL_COLOR_ATTACHMENT0
+    }
+
+    #[test]
+    fn shader_translation_target_overridable_via_env_var() {
+        std::env::set_var("RENDERER_SHADER_TRANSLATION_TARGET", "es");
+        assert!(crate::shader_translation_is_es());
+        std::env::set_var("RENDERER_SHADER_TRANSLATION_TARGET", "desktop_440");
+        assert!(!crate::shader_translation_is_es());
+        std::env::set_var("RENDERER_SHADER_TRANSLATION_TARGET", "desktop_450");
+        assert!(!crate::shader_translation_is_es());
+        std::env::set_var("RENDERER_SHADER_TRANSLATION_TARGET", "invalid");
+        // Unknown values fall back to probing instead of panicking.
+        let _ = crate::shader_translation_is_es();
+        std::env::remove_var("RENDERER_SHADER_TRANSLATION_TARGET");
+    }
+}

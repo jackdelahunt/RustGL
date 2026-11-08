@@ -1,0 +1,133 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  RustGL universal renderer plugin for Minecraft: Java Edition launchers on Android.
+
+  One APK, four ABIs (arm64-v8a, armeabi-v7a, x86, x86_64), three plugin contracts:
+
+    * RendererPlugin v2 (`fclPlugin_V2` -> @string/config, the JSON in
+      android-plugin/renderer-config.json) - Zalith Launcher 2 (upstream
+      ZalithLauncher/ZalithLauncher2) and FCL (Fold Craft Launcher).
+    * RendererPlugin v1 (`fclPlugin` / `zalithRendererPlugin` + `renderer`, `des`,
+      `pojavEnv`, `boatEnv`) - Zalith Launcher 1 / Gurkha Launcher, FCL's legacy
+      path, and Pojav-family forks (Mojo Launcher and others) that kept the FCL
+      v1 metadata reader.
+    * The plain native library (`lib/<abi>/librustgl.so`) plus the per-ABI ZIPs
+      and the local-import ZIP published with every release, for launchers that
+      have no plugin loader at all.
+
+  Both FCL and Zalith Launcher 2 find plugins with
+  PackageManager.queryIntentActivities(Intent.ACTION_MAIN), so the exported
+  MainActivity below is part of the contract, not decoration: without it the
+  package is invisible to those launchers.
+
+  The v1 `renderer` value is "<renderer id>:<gl library>:<egl library>". The EGL
+  name starts with "/", which makes every documented v1 launcher prepend the
+  plugin's nativeLibraryDir (RendererPlugin-v2 LegacyManifestBuilder: "以 `/`
+  开头时，启动器将自动拼接插件的 nativeLibraryDir"). A bare "librustgl.so" would
+  only resolve if the game process happened to have the plugin's library
+  directory on its search path. librustgl.so re-exports EGL, so the same file
+  is both the GL and the EGL library.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="np.com.gurkha.rustgl.plugin"
+    android:versionCode="13"
+    android:versionName="0.3.0-gurkha.13">
+
+    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="34" />
+
+    <!-- No permissions: the plugin never touches the network, storage or accounts. -->
+    <application
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:hasCode="true"
+        android:allowBackup="false"
+        android:extractNativeLibs="true"
+        android:theme="@android:style/Theme.DeviceDefault">
+
+        <!-- Required for discovery by FCL and Zalith Launcher 2 (ACTION_MAIN query). -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- RendererPlugin v2 (Zalith Launcher 2, FCL): JSON config in a string resource. -->
+        <meta-data
+            android:name="fclPlugin_V2"
+            android:resource="@string/config" />
+
+        <!-- Titles of the user-configurable environment variables of the v2 config.
+             The launchers resolve the key below to a resource id in this package and
+             read the localised text from it. -->
+        <meta-data
+            android:name="rustgl_debug_title"
+            android:resource="@string/rustgl_debug_title" />
+        <meta-data
+            android:name="rustgl_trace_title"
+            android:resource="@string/rustgl_trace_title" />
+
+        <!-- Frame-time percentiles in the log (p50/p95/p99). Two clock reads per
+             frame when on, nothing at all when off. -->
+        <meta-data
+            android:name="rustgl_framestats_title"
+            android:resource="@string/rustgl_framestats_title" />
+        <meta-data
+            android:name="rustgl_spoof_title"
+            android:resource="@string/rustgl_spoof_title" />
+
+        <!-- RendererPlugin v1 markers. Every v1 reader in the wild uses one of
+             these three names: fclPlugin (FCL, Zalith/Gurkha, NuxLauncher, ...),
+             zalithRendererPlugin (Zalith forks) and pgwRendererPlugin (Pojav
+             Glow.Worm lineage: PojavLauncher-Beta-Zink, NRC for Android). -->
+        <meta-data
+            android:name="fclPlugin"
+            android:value="true" />
+        <meta-data
+            android:name="zalithRendererPlugin"
+            android:value="true" />
+        <meta-data
+            android:name="pgwRendererPlugin"
+            android:value="true" />
+        <!-- H2CO3 Launcher (and the Boat family) read their own marker and env. -->
+        <meta-data
+            android:name="h2co3LauncherPlugin"
+            android:value="true" />
+
+        <!-- id:gl:egl - see the note at the top of this file about the leading "/".
+             The id is "opengles3", the value every launcher already understands:
+             launchers derive GL context hints and EGL handling from it, and a
+             private id such as "opengles3_rust" makes that code fall through. -->
+        <meta-data
+            android:name="renderer"
+            android:value="opengles3:librustgl.so:/librustgl.so" />
+        <meta-data
+            android:name="des"
+            android:value="RustGL (Gurkha build) - OpenGL 4.5 surface on OpenGL ES 3 [v1 plugin API]" />
+
+        <!-- v1 env. Every v1 launcher splits this on ":" and then on "=", and Zalith
+             keeps only the text before the second "=", so no value here may contain
+             "=" or ":". JAVA_TOOL_OPTIONS (which needs an "=") is therefore only in
+             the v2 JSON config; add it by hand in the version settings if you use the
+             v1 entry on 1.16 or older. -->
+        <meta-data
+            android:name="pojavEnv"
+            android:value="LIBGL_ES=3:RENDERER_BACKEND=gles:RENDERER_SPOOF_GL=1:POJAV_RENDERER=opengles3" />
+        <meta-data
+            android:name="boatEnv"
+            android:value="LIBGL_ES=3:RENDERER_BACKEND=gles:RENDERER_SPOOF_GL=1:POJAV_RENDERER=opengles3" />
+        <meta-data
+            android:name="h2co3Env"
+            android:value="LIBGL_ES=3:RENDERER_BACKEND=gles:RENDERER_SPOOF_GL=1:POJAV_RENDERER=opengles3" />
+        <!-- Empty means "every version"; some readers require the keys to exist. -->
+        <meta-data
+            android:name="minMCVer"
+            android:value="" />
+        <meta-data
+            android:name="maxMCVer"
+            android:value="" />
+    </application>
+</manifest>

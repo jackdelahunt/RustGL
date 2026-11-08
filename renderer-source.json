@@ -1,0 +1,60 @@
+{
+  "renderer": "RustGL",
+  "library": "librust_gl.so",
+  "path": "rustgl",
+  "repository": "https://github.com/kushaladhikari982648-lgtm/Gurkha-launcher",
+  "branch": "arena/a8e9723f-gurkha-launcher",
+  "commit": "1726782a7989bdf9b5e50e2f3154ae2cfee06fdb",
+  "commitDate": "2026-10-24T08:00:22Z",
+  "treeHash": "bbeac11aa95dff9509a8d91c6cb6477168cff206",
+  "upstream": {
+    "repository": "https://github.com/whaltermc/rust-renderer",
+    "revision": "eb22559",
+    "note": "The renderer source vendored by Gurkha Launcher; upstream publishes no license file."
+  },
+  "syncedAt": "2026-10-26",
+  "verify": "python3 tools/check_sync.py",
+  "localChanges": [
+    {
+      "path": "crates/gl-compat/src/lib.rs",
+      "upstreamBlob": "91c8b7fd74437f60ba97a5b8f889f886f24e08a3",
+      "summary": "driver entry-point cache takes a shared read lock on the hit path; shader translation results are memoized under a bounded cache; compile/link status is read lazily when the driver supports GL_KHR_parallel_shader_compile; glUseProgram/glDeleteProgram track the current program; GLSL-only extensions shader packs probe for are advertised under their own tested table; eglSwapBuffers can time frames (RENDERER_FRAME_STATS=1); the EGL 1.5 / EGL_EXT_platform_base entry points SDL3 tries first are served by forwarding with an EGL 1.4 fallback; and a desktop-GL context request (the one Minecraft 26.3+ makes through SDL3) is rewritten into an ES 3 request, while an ES request is left strictly alone.; the GL version and GLSL version reported to the game are now chosen from the driver underneath (ES 3.2 -> GL 4.5 / GLSL 4.50, ES 3.1 -> 4.3 / 4.30, ES 3.0 -> 3.3 / 3.30, anything older -> 2.1 / 1.20) instead of always claiming 4.5, so a driver that cannot do compute, image load/store or indirect draws is never asked for them, and GL_RENDERER reports the probed ES version instead of a hardcoded 3.2 - the decision is logged once as \"[GLCompat] driver is OpenGL ES x.y ...; claiming GL a.b / GLSL c.d\"; eglChooseConfig now retries with progressively plainer attribute lists when the driver matches zero configs (drop multisampling and stencil, then alpha and clamp depth to 16, then keep only the surface and renderable requirements) and logs every step, and eglCreateContext falls back to a minimal ES 3 list, then an ES 2 list, then no list at all, because a driver that refuses those has refused the config rather than the attributes; RENDERER_GL_VERSION=33|43|45 forces the claimed GL version for triage; and JNI_OnLoad publishes the absolute path of this library into the org.lwjgl.opengl.libname and org.lwjgl.egl.libname system properties when nothing has set them, because LWJGL dlopens an absolute path directly (METHOD 1 in its Library.loadNative) while every name it searches for - libGLX.so.0, libGL.so.1, libGL.so - is a desktop name that Android does not have, and a matching SONAME is not enough because a library loaded from Java sits in a different linker namespace than the dlopen LWJGL performs; the path comes from /proc/self/maps and the whole thing gives up silently on any failure, so RENDERER_PUBLISH_PATH=0 disables it"
+    },
+    {
+      "path": "crates/gl-compat/src/gl/v3_3.rs",
+      "upstreamBlob": "10ff06ca868227e71c42a2aefa85fd46a63a551a",
+      "summary": "the CPU base-vertex re-base reuses a thread-local staging buffer instead of allocating one per draw."
+    },
+    {
+      "path": "crates/gl-compat/src/fixed_draw.rs",
+      "upstreamBlob": "2c76bb5e983a09a45483cc893a5b729d6f087d56",
+      "summary": "feeds the legacy fixed-function builtins (gl_Vertex, gl_Color, gl_Normal, gl_MultiTexCoord0..2 and the matrix stacks) as attributes and uniforms when the game draws its fixed-function arrays with its own program, which is how OptiFine and other shader packs draw; reuses the GL_QUADS index buffer as 16-bit indices where the vertex count allows, samples glGetError instead of flushing the pipeline per draw, and skips the per-draw GL_CURRENT_PROGRAM query."
+    },
+    {
+      "path": "crates/gl-compat/src/fixed_func.rs",
+      "upstreamBlob": "2263be508dfb0bcae920a81653d4eb48535e3c1c",
+      "summary": "exposes the tracked normal array so shaders reading gl_Normal can be fed, and marks the state getters the draw path calls every frame #[inline]."
+    },
+    {
+      "path": "crates/gl-compat/src/gles3/mod.rs",
+      "upstreamBlob": "029c75598b13716db90669c36d40976dbc558be5",
+      "summary": "advertises the GLSL-only and format-only extensions shader packs probe for (GL_ARB_shader_texture_lod, GL_EXT_shader_texture_lod, GL_ARB_depth_texture, GL_ARB_shadow, GL_ARB_texture_float, GL_ARB_framebuffer_object, GL_EXT_texture_array, and the colour-buffer-float pair gated on real support), all of which ES 3.x backs."
+    },
+    {
+      "path": "crates/shader-translate/src/lib.rs",
+      "upstreamBlob": "5e026e8b0b67b535089cc3cb8104c5666387aad2",
+      "summary": "fixed-function builtins now translate to rust_gl_* attributes and uniforms that gl-compat feeds, instead of identity matrices that compiled and then collapsed the world into one place; and a variable that would shadow an ES 3.00 built-in function - OptiFine's own `uniform sampler2D texture;` - is renamed, or the texture() call it is rewritten to finds no function."
+    },
+    {
+      "path": "crates/shader-translate/tests/mc_shader_fixtures.rs",
+      "upstreamBlob": "8425e7970a0ff41a335b08d4597403b42cb74c52",
+      "summary": "added Iris/OptiFine, Sodium and legacy 1.12.2 shader fixtures - including the fixed-function builtins (ftransform, gl_Vertex, gl_MultiTexCoord, gl_TextureMatrix) that shader packs read - that the GLES smoke test compiles on a real driver."
+    },
+    {
+      "path": "tests/render_smoke.py",
+      "upstreamBlob": "4399a2b21181e996b1280857e1e32b337e170423",
+      "summary": "compiles all twenty shader fixtures instead of eight, and picks the stage from any name carrying _VSH rather than _VSH_ exactly."
+    }
+  ],
+  "note": "The renderer is the Gurkha Launcher source above plus the documented localChanges (performance work, shader-pack support and shader-compile coverage). tools/check_sync.py proves every other file is byte-identical."
+}

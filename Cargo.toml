@@ -3,9 +3,16 @@ name = "render"
 version = "0.1.0"
 authors = ["jackdelahunt <jdelahun@redhat.com>"]
 edition = "2018"
+description = "Original desktop RustGL demo (SDL2 + OpenGL); the Android renderer lives in rustgl/"
 
 [dependencies]
 sdl2 = "0.34.5"
 gl = "0.10.0"
 image = "0.23.14"
 nalgebra-glm = "0.15.0"
+
+# rustgl/ is the Android/GLES RustGL renderer workspace that ships in the
+# universal plugin APK. It carries its own workspace manifest and is built
+# separately (cargo ndk ... -p gl-compat), so it is not a member here.
+[workspace]
+exclude = ["rustgl"]
