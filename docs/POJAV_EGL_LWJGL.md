@@ -110,11 +110,48 @@ Android. That is the whole bug.
 
 ### What this repository does about it
 
-The library is linked with `-Wl,-soname,libGL.so`. Bionic's `dlopen` returns an
-already-loaded library whose SONAME matches the requested name, so once the launcher has
-loaded this renderer, LWJGL's third attempt — `dlopen("libGL.so")` — resolves to it
-without any configuration. The SONAME is asserted per ABI in CI with `llvm-readelf -d`,
-because a flag silently dropped by the linker would bring the crash straight back.
+**A SONAME of `libGL.so` is not enough, and this repository tried it first.** The library
+*is* linked `-Wl,-soname,libGL.so`, and that does make `dlopen("libGL.so")` the third name
+LWJGL tries. But a library loaded from Java — `System.load`, which is what a launcher
+plugin is — lands in a **classloader linker namespace**, while LWJGL's `dlopen` runs in
+another one, and bionic's soname lookup is namespace-scoped. A build carrying that SONAME
+still failed with:
+
+```
+at org.lwjgl.system.Library.loadNative(Library.java:346)
+at org.lwjgl.opengl.GL.create(GL.java:101)
+at org.lwjgl.opengl.GL.<clinit>(GL.java:85)
+```
+
+Line 346 is `throw new UnsatisfiedLinkError("Failed to locate library: " + libName)` —
+every candidate name had been tried and none resolved.
+
+**What works is an absolute path**, because LWJGL checks it before it searches anything:
+
+```java
+// METHOD 1: absolute path
+if (Paths.get(name).isAbsolute()) {
+    SharedLibrary lib = apiCreateLibrary(name);
+    return lib;
+}
+```
+
+So the library publishes its own path. `JNI_OnLoad` runs while the launcher is loading us,
+before any LWJGL class exists — the only moment the property can still be set from in here
+— and it sets `org.lwjgl.opengl.libname` and `org.lwjgl.egl.libname` to the absolute path
+it read from `/proc/self/maps`, **unless something has already set them**. Nothing else
+about the load changes, and every step is null-checked and wrapped in `catch_unwind`: if
+any part fails, the property is left alone and the behaviour is exactly what it was before.
+`RENDERER_PUBLISH_PATH=0` turns it off.
+
+If you would rather set it yourself, the launcher's own absolute path works the same way:
+
+```
+JAVA_TOOL_OPTIONS=-Dorg.lwjgl.opengl.libname=/data/app/.../lib/arm64/librustgl.so
+```
+
+`JAVA_TOOL_OPTIONS` is the channel to use, not the instance's Java arguments: Pojav strips
+`-Dorg.lwjgl.opengl.libname` from those.
 
 The library is ready for that path: it exports `glXGetProcAddress`,
 `glXGetProcAddressARB` and `eglGetProcAddress`, and all three return *this* renderer's GL

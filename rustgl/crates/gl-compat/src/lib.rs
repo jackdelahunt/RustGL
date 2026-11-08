@@ -4053,6 +4053,231 @@ pub unsafe extern "C" fn eglSwapBuffers(dpy: *mut c_void, surface: *mut c_void) 
     presented
 }
 
+// =============================================================================
+// Telling LWJGL where this library is
+// =============================================================================
+//
+// org.lwjgl.opengl.GL loads its function provider by dlopen-ing "libGLX.so.0",
+// "libGL.so.1" and "libGL.so" - desktop names that do not exist on Android - and
+// when all of them fail it throws. A SONAME of libGL.so does not rescue it: this
+// library is loaded from Java, so it lands in a different linker namespace than
+// the dlopen LWJGL performs, and namespace-scoped soname lookup does not see it.
+//
+// What does work is an absolute path. LWJGL checks that first:
+//
+//     // METHOD 1: absolute path
+//     if (Paths.get(name).isAbsolute()) { return apiCreateLibrary(name); }
+//
+// so setting the org.lwjgl.opengl.libname system property to our own path makes
+// the very first attempt succeed, with no search at all. JNI_OnLoad runs while
+// the launcher is loading us - before any LWJGL class exists, which is the only
+// moment the property can still be set from in here.
+//
+// Every step is null-checked and the whole thing is wrapped in catch_unwind:
+// if any of it fails, the property is simply left alone and the behaviour is
+// exactly what it was before.
+
+const JNI_OK: i32 = 0;
+const JNI_VERSION_1_6: i32 = 0x0001_0006;
+
+// Indices into the JNI function tables, which are arrays of pointers. JNIEnv is
+// a pointer to the table itself, and JavaVM is a pointer to a pointer to it.
+const JNI_GET_ENV: usize = 6;
+const JNI_FIND_CLASS: usize = 6;
+const JNI_EXCEPTION_OCCURRED: usize = 15;
+const JNI_EXCEPTION_CLEAR: usize = 17;
+const JNI_DELETE_LOCAL_REF: usize = 23;
+const JNI_GET_STATIC_METHOD_ID: usize = 113;
+const JNI_CALL_STATIC_OBJECT_METHOD_A: usize = 116;
+const JNI_NEW_STRING_UTF: usize = 167;
+const JNI_GET_STRING_UTF_CHARS: usize = 169;
+const JNI_RELEASE_STRING_UTF_CHARS: usize = 170;
+
+/// `jvalue`: a union of pointer-sized values, passed as an array to the `...A` calls.
+#[repr(C)]
+struct JniValue {
+    data: u64,
+}
+
+/// Entry `index` of a JNI function table. Null when the table is unusable, so every
+/// caller can simply check and give up.
+unsafe fn jni_fn(table: *mut *mut c_void, index: usize) -> *mut c_void {
+    if table.is_null() {
+        return std::ptr::null_mut();
+    }
+    let base = *table as *mut *mut c_void;
+    if base.is_null() {
+        return std::ptr::null_mut();
+    }
+    *base.add(index)
+}
+
+/// The absolute path of the file this code is running from, read from `/proc/self/maps`.
+///
+/// `dladdr` would do, but its `Dl_info` layout differs between libcs, and getting it
+/// wrong in a function that runs during library load is not worth the risk. The maps
+/// file is stable, needs no libc declaration, and is readable everywhere.
+fn this_library_path() -> Option<String> {
+    let here = this_library_path as *const () as usize;
+    let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+    for line in maps.lines() {
+        let mut fields = line.split_whitespace();
+        let range = fields.next()?;
+        let mut bounds = range.split('-');
+        let start = usize::from_str_radix(bounds.next()?, 16).ok()?;
+        let end = usize::from_str_radix(bounds.next()?, 16).ok()?;
+        if !(start..end).contains(&here) {
+            continue;
+        }
+        // Everything after the inode is the pathname; it may contain spaces.
+        let path = line.splitn(6, ' ').nth(5)?.trim_start().trim();
+        if path.ends_with(".so") {
+            return Some(path.to_string());
+        }
+    }
+    None
+}
+
+/// Sets `org.lwjgl.opengl.libname` (and the EGL one) to our own path, unless something
+/// has already chosen a GL library.
+unsafe fn publish_library_path(vm: *mut *mut c_void) {
+    type GetEnvFn = unsafe extern "C" fn(*mut *mut c_void, *mut *mut c_void, i32) -> i32;
+    type FindClassFn = unsafe extern "C" fn(*mut *mut c_void, *const c_char) -> *mut c_void;
+    type ExceptionFn = unsafe extern "C" fn(*mut *mut c_void) -> *mut c_void;
+    type ClearFn = unsafe extern "C" fn(*mut *mut c_void);
+    type DeleteFn = unsafe extern "C" fn(*mut *mut c_void, *mut c_void);
+    type MethodIdFn =
+        unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const c_char, *const c_char) -> *mut c_void;
+    type CallStaticFn =
+        unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *mut c_void, *const JniValue) -> *mut c_void;
+    type NewStringFn = unsafe extern "C" fn(*mut *mut c_void, *const c_char) -> *mut c_void;
+    type GetCharsFn = unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *mut u8) -> *const c_char;
+    type ReleaseCharsFn = unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const c_char);
+
+    let get_env: GetEnvFn = std::mem::transmute(jni_fn(vm, JNI_GET_ENV));
+    let mut raw_env: *mut c_void = std::ptr::null_mut();
+    if get_env(vm, &mut raw_env, JNI_VERSION_1_6) != JNI_OK || raw_env.is_null() {
+        log("[GLBridge] publish: JNI GetEnv unavailable; leaving the LWJGL library name alone");
+        return;
+    }
+    let env = raw_env as *mut *mut c_void;
+
+    let find_class: FindClassFn = std::mem::transmute(jni_fn(env, JNI_FIND_CLASS));
+    let occurred: ExceptionFn = std::mem::transmute(jni_fn(env, JNI_EXCEPTION_OCCURRED));
+    let clear: ClearFn = std::mem::transmute(jni_fn(env, JNI_EXCEPTION_CLEAR));
+    let delete: DeleteFn = std::mem::transmute(jni_fn(env, JNI_DELETE_LOCAL_REF));
+    let method_id: MethodIdFn = std::mem::transmute(jni_fn(env, JNI_GET_STATIC_METHOD_ID));
+    let call_static: CallStaticFn = std::mem::transmute(jni_fn(env, JNI_CALL_STATIC_OBJECT_METHOD_A));
+    let new_string: NewStringFn = std::mem::transmute(jni_fn(env, JNI_NEW_STRING_UTF));
+    let get_chars: GetCharsFn = std::mem::transmute(jni_fn(env, JNI_GET_STRING_UTF_CHARS));
+    let release_chars: ReleaseCharsFn = std::mem::transmute(jni_fn(env, JNI_RELEASE_STRING_UTF_CHARS));
+
+    if [find_class as *mut c_void, occurred as *mut c_void, clear as *mut c_void,
+        delete as *mut c_void, method_id as *mut c_void, call_static as *mut c_void,
+        new_string as *mut c_void, get_chars as *mut c_void, release_chars as *mut c_void]
+        .iter()
+        .any(|f| f.is_null())
+    {
+        log("[GLBridge] publish: the JNI table is missing entries; leaving the name alone");
+        return;
+    }
+
+    let system = find_class(env, c"java/lang/System".as_ptr());
+    if system.is_null() {
+        let _ = occurred(env);
+        clear(env);
+        log("[GLBridge] publish: java/lang/System not found");
+        return;
+    }
+    let get_property = method_id(
+        env,
+        system,
+        c"getProperty".as_ptr(),
+        c"(Ljava/lang/String;)Ljava/lang/String;".as_ptr(),
+    );
+    let set_property = method_id(
+        env,
+        system,
+        c"setProperty".as_ptr(),
+        c"(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;".as_ptr(),
+    );
+    if get_property.is_null() || set_property.is_null() {
+        let _ = occurred(env);
+        clear(env);
+        log("[GLBridge] publish: System.getProperty/setProperty not found");
+        return;
+    }
+
+    let path = match this_library_path() {
+        Some(path) => path,
+        None => {
+            log("[GLBridge] publish: could not work out our own path from /proc/self/maps");
+            return;
+        }
+    };
+
+    for key in [c"org.lwjgl.opengl.libname", c"org.lwjgl.egl.libname"] {
+        let key_str = new_string(env, key.as_ptr());
+        if key_str.is_null() {
+            continue;
+        }
+        let current = call_static(env, system, get_property, &[JniValue { data: key_str as u64 }]);
+        let already_set = if current.is_null() {
+            false
+        } else {
+            let chars = get_chars(env, current, std::ptr::null_mut());
+            let set = !chars.is_null()
+                && !std::ffi::CStr::from_ptr(chars).to_str().unwrap_or("").is_empty();
+            if !chars.is_null() {
+                release_chars(env, current, chars);
+            }
+            set
+        };
+        delete(env, current);
+        if already_set {
+            log(&format!("[GLBridge] publish: {} is already set; not overriding it",
+                key.to_str().unwrap_or("?")));
+            delete(env, key_str);
+            continue;
+        }
+        let value = match std::ffi::CString::new(path.as_str()) {
+            Ok(value) => new_string(env, value.as_ptr()),
+            Err(_) => std::ptr::null_mut(),
+        };
+        if value.is_null() {
+            delete(env, key_str);
+            continue;
+        }
+        let previous = call_static(
+            env,
+            system,
+            set_property,
+            &[JniValue { data: key_str as u64 }, JniValue { data: value as u64 }],
+        );
+        delete(env, previous);
+        delete(env, value);
+        delete(env, key_str);
+        log(&format!("[GLBridge] publish: {} = {path}", key.to_str().unwrap_or("?")));
+    }
+}
+
+/// Runs when a launcher loads this library from Java with `System.load`. Nothing here is
+/// allowed to fail the load: the worst case is that the property is not set, which is the
+/// behaviour of every build before this one.
+#[no_mangle]
+pub extern "C" fn JNI_OnLoad(vm: *mut c_void, _reserved: *mut c_void) -> i32 {
+    if std::env::var("RENDERER_PUBLISH_PATH").as_deref() == Ok("0") {
+        return JNI_VERSION_1_6;
+    }
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        publish_library_path(vm as *mut *mut c_void)
+    }));
+    if outcome.is_err() {
+        log("[GLBridge] JNI_OnLoad: publishing the library path panicked; ignored");
+    }
+    JNI_VERSION_1_6
+}
+
 /// eglGetProcAddress: our GL symbols first, then system EGL.
 #[no_mangle]
 pub unsafe extern "C" fn eglGetProcAddress(name: *const c_char) -> *const c_void {
@@ -4162,6 +4387,16 @@ mod tests {
         assert!(relax_config_attribs(&[EGL_NONE], 1).is_none(), "an empty list cannot be relaxed");
         assert_eq!(relax_config_attribs(&asked, 1).unwrap().last(), Some(&EGL_NONE),
             "every list stays terminated");
+    }
+
+    /// The path lookup runs during library load, where a panic would fail the load. It has
+    /// to answer without panicking from a process that is not a shared library at all.
+    #[test]
+    fn this_library_path_answers_without_panicking() {
+        match this_library_path() {
+            Some(path) => assert!(path.ends_with(".so"), "a library path was {path}"),
+            None => {} // a test binary is not a .so, so this is the expected answer here
+        }
     }
 
     #[test]
