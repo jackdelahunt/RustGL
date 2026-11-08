@@ -4227,7 +4227,8 @@ unsafe fn publish_library_path(vm: *mut *mut c_void) {
         if key_str.is_null() {
             continue;
         }
-        let current = call_static(env, system, get_property, &[JniValue { data: key_str as u64 }]);
+        let args = [JniValue { data: key_str as u64 }];
+        let current = call_static(env, system, get_property, args.as_ptr());
         let already_set = if current.is_null() {
             false
         } else {
@@ -4254,12 +4255,8 @@ unsafe fn publish_library_path(vm: *mut *mut c_void) {
             delete(env, key_str);
             continue;
         }
-        let previous = call_static(
-            env,
-            system,
-            set_property,
-            &[JniValue { data: key_str as u64 }, JniValue { data: value as u64 }],
-        );
+        let args = [JniValue { data: key_str as u64 }, JniValue { data: value as u64 }];
+        let previous = call_static(env, system, set_property, args.as_ptr());
         delete(env, previous);
         delete(env, value);
         delete(env, key_str);
