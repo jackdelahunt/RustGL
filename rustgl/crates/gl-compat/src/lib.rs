@@ -560,6 +560,27 @@ fn spoof_gl() -> bool {
 /// build, or an entry point that is not there. Older Mali parts are exactly those drivers,
 /// which is how the same build can work on an Adreno and fail on a Mali.
 fn claimed_version() -> (i32, i32, &'static [u8], &'static [u8]) {
+    // Escape hatch for triage: RENDERER_GL_VERSION=33 or 43 forces a lower claim without
+    // a rebuild, which is how you find out whether a game that reports a failed OpenGL
+    // path is objecting to the version or to something underneath it.
+    if let Ok(forced) = std::env::var("RENDERER_GL_VERSION") {
+        let claim = match forced.as_str() {
+            "45" | "4.5" => Some((4, 5, b"4.5 (Core Profile) RustGL\0".as_slice(), b"4.50\0".as_slice())),
+            "43" | "4.3" => Some((4, 3, b"4.3 (Core Profile) RustGL\0".as_slice(), b"4.30\0".as_slice())),
+            "33" | "3.3" => Some((3, 3, b"3.3 (Core Profile) RustGL\0".as_slice(), b"3.30\0".as_slice())),
+            _ => None,
+        };
+        if let Some(claim) = claim {
+            static FORCED_ONCE: OnceLock<()> = OnceLock::new();
+            if FORCED_ONCE.set(()).is_ok() {
+                log(&format!(
+                    "[GLCompat] RENDERER_GL_VERSION={forced}: claiming GL {}.{} regardless of the driver",
+                    claim.0, claim.1
+                ));
+            }
+            return claim;
+        }
+    }
     let caps = gles3::caps();
     if !caps.valid {
         // Nothing has been measured yet - no context has been current. Guessing downwards
@@ -3378,7 +3399,6 @@ egl_export!(eglGetDisplay(display_id: *mut c_void) -> *mut c_void);
 egl_export!(eglInitialize(dpy: *mut c_void, major: *mut i32, minor: *mut i32) -> u32);
 egl_export!(eglTerminate(dpy: *mut c_void) -> u32);
 egl_export!(eglGetConfigs(dpy: *mut c_void, configs: *mut *mut c_void, config_size: i32, num: *mut i32) -> u32);
-egl_export!(eglChooseConfig(dpy: *mut c_void, attrib: *const i32, configs: *mut *mut c_void, config_size: i32, num: *mut i32) -> u32);
 egl_export!(eglGetConfigAttrib(dpy: *mut c_void, config: *mut c_void, attr: i32, value: *mut i32) -> u32);
 egl_export!(eglCreateWindowSurface(dpy: *mut c_void, config: *mut c_void, win: *mut c_void, attrib: *const i32) -> *mut c_void);
 egl_export!(eglCreatePbufferSurface(dpy: *mut c_void, config: *mut c_void, attrib: *const i32) -> *mut c_void);
@@ -3503,6 +3523,119 @@ unsafe fn read_attrib_list(attribs: *const i32) -> Vec<i32> {
     }
 }
 
+/// EGL config attribute names used by the `eglChooseConfig` fallback below.
+const EGL_ALPHA_SIZE: i32 = 0x3021;
+const EGL_DEPTH_SIZE: i32 = 0x3025;
+const EGL_STENCIL_SIZE: i32 = 0x3026;
+const EGL_SAMPLES: i32 = 0x3031;
+const EGL_SAMPLE_BUFFERS: i32 = 0x3032;
+const EGL_SURFACE_TYPE: i32 = 0x3033;
+const EGL_RENDERABLE_TYPE: i32 = 0x3040;
+
+/// The next, plainer `eglChooseConfig` attribute list to try: `None` when there is nothing
+/// left to relax.
+///
+/// Some drivers - several Mali parts among them - answer `EGL_TRUE` with **zero** configs
+/// for a list they cannot satisfy, typically depth 24 plus stencil 8 plus multisampling.
+/// The launcher then reports a failed OpenGL path with nothing to say what was refused, so
+/// each step drops the attribute most likely to be the one:
+///
+/// 1. multisampling and stencil, 2. alpha too, and depth clamped to 16,
+/// 3. only the surface and renderable requirements survive.
+fn relax_config_attribs(attribs: &[i32], step: usize) -> Option<Vec<i32>> {
+    if attribs.len() <= 1 {
+        return None; // only EGL_NONE: there is nothing to relax
+    }
+    let dropped: &[i32] = match step {
+        1 => &[EGL_SAMPLES, EGL_SAMPLE_BUFFERS, EGL_STENCIL_SIZE],
+        2 => &[EGL_SAMPLES, EGL_SAMPLE_BUFFERS, EGL_STENCIL_SIZE, EGL_ALPHA_SIZE],
+        3 => &[EGL_SAMPLES, EGL_SAMPLE_BUFFERS, EGL_STENCIL_SIZE, EGL_ALPHA_SIZE],
+        _ => return None,
+    };
+    let mut out: Vec<i32> = Vec::with_capacity(attribs.len());
+    let mut i = 0;
+    while i + 1 < attribs.len() {
+        let (key, value) = (attribs[i], attribs[i + 1]);
+        if key == EGL_NONE {
+            break;
+        }
+        if dropped.contains(&key) {
+            i += 2;
+            continue;
+        }
+        if step >= 3 && key != EGL_SURFACE_TYPE && key != EGL_RENDERABLE_TYPE {
+            i += 2;
+            continue;
+        }
+        if key == EGL_DEPTH_SIZE && value > 16 && step >= 2 {
+            out.push(key);
+            out.push(16);
+        } else {
+            out.push(key);
+            out.push(value);
+        }
+        i += 2;
+    }
+    out.push(EGL_NONE);
+    if out.len() == 1 {
+        None // nothing survived
+    } else {
+        Some(out)
+    }
+}
+
+/// `eglChooseConfig`, with a fallback when the driver matches nothing.
+///
+/// A plain forward returns whatever the driver said, and a driver that matched zero configs
+/// leaves the caller with no context and no explanation - which is what "the OpenGL path
+/// failed" looks like from the launcher. Here a failed match is retried with progressively
+/// plainer requirements, and every retry is logged, so a working context is found when one
+/// exists and a bug report names the list that finally matched.
+#[no_mangle]
+pub unsafe extern "C" fn eglChooseConfig(
+    dpy: *mut c_void,
+    attrib: *const i32,
+    configs: *mut *mut c_void,
+    config_size: i32,
+    num: *mut i32,
+) -> u32 {
+    type F = unsafe extern "C" fn(*mut c_void, *const i32, *mut *mut c_void, i32, *mut i32) -> u32;
+    let Some(f) = egl_sym::<F>(b"eglChooseConfig\0") else {
+        return 0; // EGL_FALSE: nothing to call
+    };
+    let asked = if attrib.is_null() { Vec::new() } else { read_attrib_list(attrib) };
+    let mut step = 0usize;
+    loop {
+        let list = if step == 0 {
+            asked.clone()
+        } else {
+            match relax_config_attribs(&asked, step) {
+                Some(list) => list,
+                None => break,
+            }
+        };
+        let ptr = if list.is_empty() {
+            std::ptr::null()
+        } else {
+            list.as_ptr()
+        };
+        let matched = f(dpy, ptr, configs, config_size, num);
+        let count = if num.is_null() { -1 } else { *num };
+        if matched != 0 && count > 0 {
+            if step > 0 {
+                log(&format!(
+                    "[GLBridge] eglChooseConfig: the requested config matched nothing; retry {step} matched {count}"
+                ));
+            }
+            return matched;
+        }
+        log(&format!("[GLBridge] eglChooseConfig: step {step} matched {count} configs"));
+        step += 1;
+    }
+    log("[GLBridge] eglChooseConfig: no config matched, even with the list relaxed");
+    0
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn eglCreateContext(
     dpy: *mut c_void,
@@ -3529,9 +3662,36 @@ pub unsafe extern "C" fn eglCreateContext(
         log("[GLBridge] normalised context attributes were refused; retrying verbatim");
         let original = if asked.is_empty() { std::ptr::null() } else { asked.as_ptr() };
         if let Some(f) = egl_sym::<F>(b"eglCreateContext\0") {
-            return f(dpy, config, share, original);
+            let ctx = f(dpy, config, share, original);
+            if !ctx.is_null() {
+                return ctx;
+            }
         }
-        return std::ptr::null_mut();
+    }
+    if ctx.is_null() {
+        // Last resorts, in order: the shortest list an ES driver accepts, then no list at
+        // all. A driver that refuses both has refused the config, not the attributes, and
+        // the log above says which config it was given.
+        for version in [3i32, 2i32] {
+            let minimal = [EGL_CONTEXT_VERSION, version, EGL_NONE];
+            if let Some(f) = egl_sym::<F>(b"eglCreateContext\0") {
+                let ctx = f(dpy, config, share, minimal.as_ptr());
+                if !ctx.is_null() {
+                    log(&format!(
+                        "[GLBridge] eglCreateContext: succeeded with a minimal ES {version} attribute list"
+                    ));
+                    return ctx;
+                }
+            }
+        }
+        if let Some(f) = egl_sym::<F>(b"eglCreateContext\0") {
+            let ctx = f(dpy, config, share, std::ptr::null());
+            if !ctx.is_null() {
+                log("[GLBridge] eglCreateContext: succeeded with no attribute list");
+                return ctx;
+            }
+        }
+        log("[GLBridge] eglCreateContext: refused every attribute list tried");
     }
     if changed && !ctx.is_null() {
         log("[GLBridge] eglCreateContext: desktop-GL attributes rewritten to ES 3");
@@ -3970,6 +4130,38 @@ mod tests {
 
     fn name_of(entry: &[u8]) -> &[u8] {
         entry.strip_suffix(&[0u8]).unwrap_or(entry)
+    }
+
+    /// The eglChooseConfig fallback has to give up one requirement at a time, and has to
+    /// stop: a driver that matched nothing must not be asked the same question forever.
+    #[test]
+    fn config_attribs_relax_one_step_at_a_time() {
+        let asked = [
+            EGL_SURFACE_TYPE, 0x0004,      // EGL_WINDOW_BIT
+            EGL_RENDERABLE_TYPE, 0x0040,   // EGL_OPENGL_ES3_BIT_KHR
+            0x3024, 8,                     // EGL_RED_SIZE
+            EGL_DEPTH_SIZE, 24,
+            EGL_STENCIL_SIZE, 8,
+            EGL_SAMPLE_BUFFERS, 1,
+            EGL_NONE,
+        ];
+        let one = relax_config_attribs(&asked, 1).expect("step 1 relaxes something");
+        assert!(!one.windows(2).any(|pair| pair[0] == EGL_STENCIL_SIZE
+            || pair[0] == EGL_SAMPLE_BUFFERS), "{one:?}");
+        assert!(one.windows(2).any(|pair| pair[0] == EGL_DEPTH_SIZE && pair[1] == 24),
+            "depth is not the first thing to give up: {one:?}");
+
+        let two = relax_config_attribs(&asked, 2).expect("step 2 relaxes more");
+        assert!(two.windows(2).any(|pair| pair[0] == EGL_DEPTH_SIZE && pair[1] == 16),
+            "depth is clamped to 16 at step 2: {two:?}");
+
+        let three = relax_config_attribs(&asked, 3).expect("step 3 keeps the requirements");
+        assert_eq!(three, vec![EGL_SURFACE_TYPE, 0x0004, EGL_RENDERABLE_TYPE, 0x0040, EGL_NONE]);
+
+        assert!(relax_config_attribs(&asked, 4).is_none(), "there is nothing left to relax");
+        assert!(relax_config_attribs(&[EGL_NONE], 1).is_none(), "an empty list cannot be relaxed");
+        assert_eq!(relax_config_attribs(&asked, 1).unwrap().last(), Some(&EGL_NONE),
+            "every list stays terminated");
     }
 
     #[test]

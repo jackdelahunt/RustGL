@@ -17,6 +17,39 @@ EGL context/gameplay not yet verified
 This page explains what that exception actually means, why it is not about your GPU, what
 EGL has to return for this renderer to work, and how to make LWJGL use EGL deliberately.
 
+## If the launcher says the OpenGL path failed
+
+That message means the game got as far as asking for a context and did not get one. With
+0.3.0-gurkha.12 there are three places that can refuse it, and all three now say so in the
+log instead of failing silently:
+
+| what refuses | what this renderer does now |
+|---|---|
+| `eglChooseConfig` matched **zero** configs | retries with plainer requirements: first without multisampling and stencil, then without alpha and with depth clamped to 16, then with only the surface and renderable requirements. Every step is logged, including the one that matched. |
+| `eglCreateContext` refused the rewritten list | retries verbatim, then with a minimal ES 3 list, then an ES 2 list, then no list at all |
+| the game objects to the version it was told | `RENDERER_GL_VERSION=33` or `43` forces a lower claim without a rebuild |
+
+The zero-config case is the one worth explaining, because it is the classic Mali failure
+and it is invisible: `eglChooseConfig` returns **`EGL_TRUE`** - the call succeeded - with
+`num_config = 0`. Nothing raised an error, so the launcher has nothing to report except
+that the OpenGL path failed. depth 24 + stencil 8 + multisampling in one request is the
+usual trigger, and the driver will happily satisfy any two of the three.
+
+The log lines to look for:
+
+```
+[GLBridge] eglChooseConfig: step 0 matched 0 configs
+[GLBridge] eglChooseConfig: the requested config matched nothing; retry 1 matched 12
+```
+
+**A config found by relaxing is a plainer config.** If retry 1 dropped stencil, the game
+runs without a stencil buffer; if it clamped depth, z-fighting becomes more likely. That is
+the trade: a plainer frame rather than no frame, and the log says which one you got.
+
+**`RENDERER_GL_VERSION` is a triage switch, not a setting.** Set it, see whether the game
+starts, then unset it. If the game only starts with `33`, the bug is in what this layer
+claims at 4.5, and that is worth a report.
+
 ## 1. Why LWJGL cannot detect a context management API
 
 **It fires before any GL call, and before your GPU is involved.** `org.lwjgl.opengl.GL`
