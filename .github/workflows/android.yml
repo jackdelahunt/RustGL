@@ -2,7 +2,9 @@ name: RustGL universal plugin APK
 
 on:
   push:
-    branches: [arena/23f25781-rustgl-for-gurkha-launcher]
+    # Any Arena working branch, not one pinned name: a build that silently
+    # never runs is worse than no CI at all.
+    branches: ['arena/**']
     tags: ['v*']
   pull_request:
   workflow_dispatch:
