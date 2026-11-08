@@ -4117,8 +4117,12 @@ unsafe fn jni_fn(table: *mut *mut c_void, index: usize) -> *mut c_void {
 /// `dladdr` would do, but its `Dl_info` layout differs between libcs, and getting it
 /// wrong in a function that runs during library load is not worth the risk. The maps
 /// file is stable, needs no libc declaration, and is readable everywhere.
+static PATH_LOOKUP_MARKER: u8 = 0;
+
 fn this_library_path() -> Option<String> {
-    let here = this_library_path as *const () as usize;
+    // The address of a static in this crate, rather than of a function: casting a
+    // function item to a data pointer is not something Rust allows you to write.
+    let here = &PATH_LOOKUP_MARKER as *const u8 as usize;
     let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
     for line in maps.lines() {
         let mut fields = line.split_whitespace();
@@ -4172,11 +4176,13 @@ unsafe fn publish_library_path(vm: *mut *mut c_void) {
     let get_chars: GetCharsFn = std::mem::transmute(jni_fn(env, JNI_GET_STRING_UTF_CHARS));
     let release_chars: ReleaseCharsFn = std::mem::transmute(jni_fn(env, JNI_RELEASE_STRING_UTF_CHARS));
 
-    if [find_class as *mut c_void, occurred as *mut c_void, clear as *mut c_void,
-        delete as *mut c_void, method_id as *mut c_void, call_static as *mut c_void,
-        new_string as *mut c_void, get_chars as *mut c_void, release_chars as *mut c_void]
+    // A function pointer cannot be cast straight to a data pointer, so null is tested
+    // through its address instead.
+    if [find_class as usize, occurred as usize, clear as usize, delete as usize,
+        method_id as usize, call_static as usize, new_string as usize, get_chars as usize,
+        release_chars as usize]
         .iter()
-        .any(|f| f.is_null())
+        .any(|address| *address == 0)
     {
         log("[GLBridge] publish: the JNI table is missing entries; leaving the name alone");
         return;
