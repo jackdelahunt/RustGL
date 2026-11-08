@@ -91,6 +91,13 @@ Honest limit: this change was reasoned from the code and from what each ES versi
 back. No Mali device was available here, so while it removes a claim that was false on
 those parts, it has not been run on one.
 
+## If LWJGL says "There is no OpenGL context management API available"
+
+That is a library-name problem, not a GPU one, and it is answered in
+[`docs/POJAV_EGL_LWJGL.md`](POJAV_EGL_LWJGL.md) - including the EGL sequence, the value each
+call has to return, and the debug flags. From 0.3.0-gurkha.11 the library is linked with
+`-Wl,-soname,libGL.so`, which is what lets LWJGL find it without configuration.
+
 ## If it crashes on a 64-bit phone but works on a 32-bit one
 
 **Check the page size first.** Android 15 introduced 16 KB memory pages, and a shared

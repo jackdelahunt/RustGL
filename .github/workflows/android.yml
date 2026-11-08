@@ -64,12 +64,22 @@ jobs:
         id: native
         env:
           CARGO_TERM_COLOR: never
-          RUSTFLAGS: "-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384"
+          RUSTFLAGS: "-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384 -C link-arg=-Wl,-soname,libGL.so"
           # Android 15+ devices run with 16 KB pages, and a library whose ELF segments
           # are only 4 KB aligned fails to load on them at all - dlopen reports "has bad
           # ELF alignment", which from the launcher looks like "the renderer crashes".
           # zipalign -P 16 aligns the entry inside the APK; this aligns the ELF inside
           # the library, which is the half that has to come from the linker.
+          #
+          # -soname=libGL.so is what lets LWJGL find this library unconfigured. LWJGL's
+          # org.lwjgl.opengl.GL resolves its function provider by dlopen-ing, in order,
+          # "libGLX.so.0", "libGL.so.1" and "libGL.so" - none of which exist on Android,
+          # where EGL ships as "libEGL.so" with no ".1". Unconfigured it throws
+          # "There is no OpenGL context management API available." A launcher can avoid
+          # that with -Dorg.lwjgl.opengl.libname=<path>, but the plugin cannot pass -D
+          # properties on the v1 contract, and bionic's dlopen returns an already-loaded
+          # library whose SONAME matches the requested name, so claiming libGL.so is what
+          # makes the third attempt succeed without any configuration at all.
         run: |
           set -o pipefail
           {
@@ -81,6 +91,17 @@ jobs:
             cargo ndk -t arm64-v8a -t armeabi-v7a -t x86 -t x86_64 build --release -p gl-compat
             cd ..
             python3 tools/collect_native.py --target rustgl/target --output artifacts/rustgl
+            # The SONAME above is the whole reason LWJGL finds this library: assert it
+            # survived the link, per ABI, rather than trusting the flag was applied.
+            readelf="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+            for lib in artifacts/rustgl/*/*.so; do
+              soname=$("$readelf" -d "$lib" | sed -n 's/.*(SONAME).*\[\(.*\)\].*/\1/p')
+              echo "$lib: SONAME=$soname"
+              if [ "$soname" != "libGL.so" ]; then
+                echo "::error title=$lib has no libGL.so SONAME::LWJGL cannot find it: $soname"
+                exit 1
+              fi
+            done
           } 2>&1 | tee "$RUNNER_TEMP/rustgl-native.log"
       - name: Report the native build failure
         if: failure() && steps.native.outcome != 'success'
